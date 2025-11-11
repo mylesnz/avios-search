@@ -68,7 +68,7 @@ jobs:
           SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
           SEATSAERO_ROUTES_URL: ${{ secrets.SEATSAERO_ROUTES_URL }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          TO_EMAIL:   ${{ secrets/TO_EMAIL }}
+          TO_EMAIL:   ${{ secrets.TO_EMAIL }}
           SMTP_HOST:  ${{ secrets.SMTP_HOST }}
           SMTP_PORT:  ${{ secrets.SMTP_PORT }}
           SMTP_USER:  ${{ secrets.SMTP_USER }}
