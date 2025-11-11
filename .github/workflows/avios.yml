@@ -1,0 +1,28 @@
+name: Daily Qatar Avios EU Email
+
+on:
+  schedule:
+    - cron: "0 18 * * *"   # 18:00 UTC ≈ 07:00 NZT
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --upgrade pip
+      - run: python seats_avios_daily.py
+        env:
+          SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+          SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
+          SEATSAERO_ROUTES_URL: ${{ secrets.SEATSAERO_ROUTES_URL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          FROM_NAME: "Qatar Avios Bot"
+          TO_EMAIL: "Myles.Richardson@gmail.com"
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
