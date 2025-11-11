@@ -2,7 +2,7 @@ name: Daily Qatar Avios EU Email
 
 on:
   schedule:
-    - cron: "0 18 * * *"   # Runs daily at 07:00 NZT (≈ 18:00 UTC)
+    - cron: "0 18 * * *"   # ~07:00 NZT daily
   workflow_dispatch:
 
 jobs:
@@ -13,30 +13,67 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Show repo tree (top level)
+        run: |
+          pwd
+          ls -la
+          echo "---- .github/workflows ----"
+          ls -la .github/workflows || true
+
+      - name: Confirm script exists
+        run: |
+          test -f "seats_avios_daily.py" || (echo "ERROR: seats_avios_daily.py not found at repo root" && exit 1)
+          sed -n '1,40p' seats_avios_daily.py || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Python version
+        run: python -V
+
+      - name: Check required secrets are present
+        env:
+          SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+          SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
-          python -m pip install --upgrade pip
+          missing=0
+          for k in SEATSAERO_API_KEY SEATSAERO_AVAIL_URL FROM_EMAIL TO_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS; do
+            v=$(printenv $k)
+            if [ -z "$v" ]; then
+              echo "❌ Missing secret: $k"
+              missing=1
+            else
+              echo "✅ $k present"
+            fi
+          done
+          if [ $missing -ne 0 ]; then
+            echo "One or more required secrets are missing. Add them in Repo → Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      - name: Install dependencies (none needed; keep pip fresh)
+        run: python -m pip install --upgrade pip
 
       - name: Run Avios daily script
-        run: python seats_avios_daily.py
         env:
-          # --- Seats.aero configuration ---
           SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
           SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
           SEATSAERO_ROUTES_URL: ${{ secrets.SEATSAERO_ROUTES_URL }}
-
-          # --- Email (Brevo SMTP) configuration ---
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          TO_EMAIL:   ${{ secrets.TO_EMAIL }}
+          TO_EMAIL:   ${{ secrets/TO_EMAIL }}
           SMTP_HOST:  ${{ secrets.SMTP_HOST }}
           SMTP_PORT:  ${{ secrets.SMTP_PORT }}
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
-
-          # Optional friendly name shown in your inbox
-          FROM_NAME: "Qatar Avios Bot"
+          FROM_NAME:  "Qatar Avios Bot"
+        run: |
+          echo "Running seats_avios_daily.py ..."
+          python seats_avios_daily.py
