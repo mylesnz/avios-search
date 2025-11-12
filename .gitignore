@@ -1,0 +1,6 @@
+.env.avios
+.seen_hits.json
+out.html
+seats_avios_daily.old
+seats_avios_daily.py.bak
+
