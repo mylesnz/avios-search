@@ -1,0 +1,37 @@
+name: Avios Daily
+
+on:
+  schedule:
+    # Runs every day at 7:00 PM UTC (8 AM NZT)
+    - cron: '0 19 * * *'
+  workflow_dispatch:  # allows manual run
+
+jobs:
+  avios-check:
+    runs-on: ubuntu-latest
+
+    env:
+      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+      FROM_NAME: ${{ secrets.FROM_NAME }}
+      TO_EMAIL: ${{ secrets.TO_EMAIL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Avios availability search
+        run: |
+          echo "🚀 Running Seats.aero → Brevo integration..."
+          python seats_avios_daily.py
