@@ -2,33 +2,31 @@
 # -*- coding: utf-8 -*-
 
 """
-Seats.aero → HTML daily report for Qatar (QR) Avios premium awards (NZ → EU use case)
+Seats.aero → HTML email for Qatar Avios EU search, grouped by month (NZ date).
+- Hub scan via DOH to avoid QR codeshare/region quirks.
+- Pairs with real origin for link generation (e.g., AKL).
+- Highlights ≤90k business sweet spots.
+- Brevo REST delivery (optional). DRY_RUN=1 to skip email.
 
-Key behaviour:
-- Scan hub legs only (DOH→EU outbound; EU→DOH return) to stay within QR-operated inventory.
-- Pair into itineraries (open-jaw allowed) with return 28–35 days after outbound, ±3 days flex.
-- Business/First only; exclude mixed-cabin.
-- Rank by Avios then cash (taxes); sweet-spot highlight ≤ 90k Avios one-way.
-- Group output by month (NZ date format dd/mm/yy). Writes out.html and prints a short preview.
-- Optional: POST to a webhook (e.g., from GitHub Actions) via WEBHOOK_URL. DRY_RUN skips delivery.
-- Optional: 7-day dedup cache in .seen_hits.json (disable via DEDUP_DAYS=0).
-
-Environment (sane defaults shown where appropriate):
-    SEATSAERO_API_KEY   = pro_************************ (required)
-    SEATSAERO_AVAIL_URL = https://seats.aero/partnerapi/availability
-    SEATSAERO_ROUTES_URL= https://seats.aero/partnerapi/routes
-    USE_HUB_MODE        = 1          # keep on; forces DOH hub scan
-    SCAN_ORIGIN         = AKL        # your real origin for links/summary only
-    USE_DYNAMIC_ROUTES  = 0          # use static EU list (recommended)
-    RATE_LIMIT_MS       = 300
-    SCAN_MONTHS         = 15         # months from today
-    FLEX_DAYS           = 3          # ± days around travel dates
-    MIN_RET_DAYS        = 28
-    MAX_RET_DAYS        = 35
-    DEDUP_DAYS          = 7
-    DRY_RUN             = 1          # write/print only
-    DEBUG               = 0
-    WEBHOOK_URL         = (optional) # if set, will POST {"subject","html","alert":false}
+Env (recommended in .env.avios):
+  SEATSAERO_API_KEY=pro_xxx
+  SEATSAERO_AVAIL_URL=https://seats.aero/partnerapi/availability
+  SEATSAERO_ROUTES_URL=https://seats.aero/partnerapi/routes
+  USE_HUB_MODE=1
+  SCAN_ORIGIN=AKL
+  USE_DYNAMIC_ROUTES=0
+  RATE_LIMIT_MS=300
+  SCAN_MONTHS=15
+  FLEX_DAYS=3
+  MIN_RET_DAYS=28
+  MAX_RET_DAYS=35
+  DEDUP_DAYS=7
+  DRY_RUN=1
+  DEBUG=1
+  BREVO_API_KEY=xkeysib-...
+  FROM_EMAIL=alert@imoffto.xyz
+  FROM_NAME=Avios Bot
+  TO_EMAIL=milo@imoffto.xyz
 """
 
 import os
@@ -36,535 +34,601 @@ import sys
 import json
 import time
 import math
-import html
-import gzip
 import ssl
-import datetime as dt
 import urllib.parse
 import urllib.request
+import datetime as dt
 from collections import defaultdict
 
-# -------- Config / Env --------
-SEATSAERO_API_KEY   = os.getenv("SEATSAERO_API_KEY", "").strip()
-AVAIL_URL           = os.getenv("SEATSAERO_AVAIL_URL", "https://seats.aero/partnerapi/availability").strip()
-ROUTES_URL          = os.getenv("SEATSAERO_ROUTES_URL", "https://seats.aero/partnerapi/routes").strip()
+# ---------------- friendly airport names ----------------
+AIRPORT_NAMES = {
+    "AKL": "Auckland",
+    "DOH": "Doha",
+    "LHR": "London Heathrow",
+    "CDG": "Paris Charles de Gaulle",
+    "AMS": "Amsterdam",
+    "ATH": "Athens",
+    "BCN": "Barcelona",
+    "BER": "Berlin",
+    "BRU": "Brussels",
+    "BUD": "Budapest",
+    "CPH": "Copenhagen",
+    "DUB": "Dublin",
+    "DUS": "Düsseldorf",
+    "FCO": "Rome",
+    "FRA": "Frankfurt",
+    "HEL": "Helsinki",
+    "LIS": "Lisbon",
+    "LYS": "Lyon",
+    "MAD": "Madrid",
+    "MUC": "Munich",
+    "MXP": "Milan",
+    "NCE": "Nice",
+    "OTP": "Bucharest",
+    "PRG": "Prague",
+    "SOF": "Sofia",
+    "VCE": "Venice",
+    "VIE": "Vienna",
+    "WAW": "Warsaw",
+    "ZAG": "Zagreb",
+}
+def airport_name(code: str) -> str:
+    return AIRPORT_NAMES.get(code, code)
 
-USE_HUB_MODE        = os.getenv("USE_HUB_MODE", "1") not in ("0", "false", "False")
-SCAN_ORIGIN         = os.getenv("SCAN_ORIGIN", "AKL").strip().upper()
-SCAN_HUB            = "DOH"  # Qatar hub
+def pretty_route(orig: str, dest: str) -> str:
+    # "AKL → DOH (Auckland → Doha)"
+    return "{} \u2192 {} ({} \u2192 {})".format(
+        orig, dest, airport_name(orig), airport_name(dest)
+    )
 
-USE_DYNAMIC_ROUTES  = os.getenv("USE_DYNAMIC_ROUTES", "0") not in ("0", "false", "False")
-RATE_LIMIT_MS       = int(os.getenv("RATE_LIMIT_MS", "300"))
-SCAN_MONTHS         = int(os.getenv("SCAN_MONTHS", "15"))
-FLEX_DAYS           = int(os.getenv("FLEX_DAYS",  "3"))
-MIN_RET_DAYS        = int(os.getenv("MIN_RET_DAYS", "28"))
-MAX_RET_DAYS        = int(os.getenv("MAX_RET_DAYS", "35"))
-DEDUP_DAYS          = int(os.getenv("DEDUP_DAYS",  "7"))
+# ---------------- config / constants ----------------
+def env_bool(key, default=False):
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip() not in ("0", "false", "False", "")
 
-WEBHOOK_URL         = os.getenv("WEBHOOK_URL", "").strip()
-DRY_RUN             = os.getenv("DRY_RUN", "0") not in ("0", "false", "False")
-DEBUG               = os.getenv("DEBUG", "0") not in ("0", "false", "False")
+def env_int(key, default):
+    try:
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
 
-OUT_HTML            = os.getenv("OUT_HTML", "out.html")
-CACHE_PATH          = os.getenv("CACHE_PATH", ".seen_hits.json")
+def env_required(key):
+    val = os.getenv(key, "").strip()
+    if not val:
+        raise SystemExit("❌ Required env var missing: {}".format(key))
+    return val
 
-# Static EU set (seed). We’ll use this if dynamic fails or is disabled.
-STATIC_EU = [
-    "AMS","ATH","BCN","BER","BRU","BUD","CPH","DUB","DUS","FCO",
-    "FRA","HEL","LIS","LYS","MAD","MUC","MXP","NCE","OTP","PRG",
-    "SOF","VCE","VIE","WAW","ZAG"
+SEATSAERO_API_KEY = env_required("SEATSAERO_API_KEY")
+SEATSAERO_AVAIL_URL = env_required("SEATSAERO_AVAIL_URL")
+SEATSAERO_ROUTES_URL = env_required("SEATSAERO_ROUTES_URL")
+
+USE_HUB_MODE     = env_bool("USE_HUB_MODE", True)
+SCAN_ORIGIN      = os.getenv("SCAN_ORIGIN", "AKL").strip().upper()
+SCAN_HUB         = "DOH"  # Qatar hub
+
+USE_DYNAMIC_ROUTES = env_bool("USE_DYNAMIC_ROUTES", False)
+RATE_LIMIT_MS      = env_int("RATE_LIMIT_MS", 300)
+SCAN_MONTHS        = env_int("SCAN_MONTHS", 15)
+FLEX_DAYS          = env_int("FLEX_DAYS", 3)
+MIN_RET_DAYS       = env_int("MIN_RET_DAYS", 28)
+MAX_RET_DAYS       = env_int("MAX_RET_DAYS", 35)
+DEDUP_DAYS         = env_int("DEDUP_DAYS", 7)
+
+DRY_RUN            = env_bool("DRY_RUN", True)
+DEBUG              = env_bool("DEBUG", False)
+
+FROM_EMAIL         = os.getenv("FROM_EMAIL", "")
+FROM_NAME          = os.getenv("FROM_NAME", "Avios Bot")
+TO_EMAIL           = os.getenv("TO_EMAIL", "")
+BREVO_API_KEY      = os.getenv("BREVO_API_KEY", "")
+
+# Static EU set (baseline)
+EU_STATIC = [
+    "AMS", "ATH", "BCN", "BER", "BRU", "BUD", "CPH", "DUB", "DUS",
+    "FCO", "FRA", "HEL", "LIS", "LYS", "MAD", "MUC", "MXP", "NCE",
+    "OTP", "PRG", "SOF", "VCE", "VIE", "WAW", "ZAG"
 ]
 
-# -------- Helpers --------
+# ---------------- utils ----------------
 def today_utc_date():
-    return dt.datetime.now(dt.UTC).date()
+    # Keep naive date, used only for ranges
+    return dt.datetime.utcnow().date()
 
 def nz_date(d: dt.date) -> str:
-    # dd/mm/yy (NZ)
-    return d.strftime("%d/%m/%y")
+    # dd/mm/yy
+    return "{:02d}/{:02d}/{:02d}".format(d.day, d.month, d.year % 100)
 
-def month_key(d: dt.date) -> str:
-    # "November 2025"
-    return d.strftime("%B %Y")
+def html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+    )
 
-def _sleep_ms(ms: int):
-    time.sleep(max(0, ms) / 1000.0)
-
-def _retry_delays():
-    # Simple backoff schedule (seconds)
-    return [0.5, 1.0, 2.0, 3.0]
-
-def _headers():
-    return {
-        "Partner-Authorization": SEATSAERO_API_KEY,
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "User-Agent": "avios-nz/1.0"
-    }
-
-def _get(url: str, timeout=30):
-    if DEBUG:
-        print(f"[GET] {url}")
-    req = urllib.request.Request(url, headers=_headers(), method="GET")
-    ctx = ssl.create_default_context()
-    last_err = None
-    for i, delay in enumerate([0] + _retry_delays()):
-        if i > 0:
-            _sleep_ms(int(delay * 1000))
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-                data = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    data = gzip.decompress(data)
-                return json.loads(data.decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            # retry on 429 / 5xx
-            if e.code in (429, 500, 502, 503, 504) and i < 4:
-                last_err = e
-                continue
-            raise
-        except Exception as e:
-            last_err = e
-            if i < 4:
-                continue
-            raise
-    raise last_err
-
-def ensure_env():
-    req = ["SEATSAERO_API_KEY", "SEATSAERO_AVAIL_URL"]
-    for k in req:
-        if not os.getenv(k):
-            print(f"❌ Required env var missing: {k}")
-            sys.exit(1)
-
-def routes_dynamic(static):
-    if not USE_DYNAMIC_ROUTES:
-        return sorted(static)
+def format_money(v):
     try:
-        params = urllib.parse.urlencode({"carrier": "QR"})
-        url = f"{ROUTES_URL}?{params}"
-        payload = _get(url)
+        n = int(v)
+        return "{:,}".format(n)
+    except Exception:
+        try:
+            f = float(v)
+            return "{:,.0f}".format(f)
+        except Exception:
+            return str(v)
+
+def tr(inner):
+    return "<tr>{}</tr>".format(inner)
+
+def td(inner):
+    return "<td style='padding:6px 8px;border-bottom:1px solid #eee;font-size:13px'>{}</td>".format(inner)
+
+def th(inner):
+    return "<th style='padding:8px 8px;border-bottom:2px solid #ccc;text-align:left;font-size:13px'>{}</th>".format(inner)
+
+def table(inner, caption=None):
+    cap = ""
+    if caption:
+        cap = "<caption style='text-align:left;font-weight:600;margin:6px 0 2px 0'>{}</caption>".format(html_escape(caption))
+    return (
+        "<table style='border-collapse:collapse;width:100%;margin:10px 0'>"
+        "{}"
+        "{}"
+        "</table>".format(cap, inner)
+    )
+
+def _get(url, headers, timeout=30):
+    if DEBUG:
+        print("[GET] {}".format(url))
+    req = urllib.request.Request(url, headers=headers)
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        body = r.read()
+        if r.status != 200:
+            raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+        return json.loads(body.decode("utf-8"))
+
+def seats_routes_qr_eu(static_list):
+    # try dynamic route discovery; fallback to static
+    if not USE_DYNAMIC_ROUTES:
+        return list(static_list)
+
+    hdr = {
+        "Accept": "application/json",
+        "Partner-Authorization": SEATSAERO_API_KEY
+    }
+    qs = urllib.parse.urlencode({"carrier": "QR"})
+    url = "{}?{}".format(SEATSAERO_ROUTES_URL, qs)
+    try:
+        payload = _get(url, hdr)
+        data = payload.get("data") if isinstance(payload, dict) else payload
         eu = set()
-        for r in (payload.get("data") if isinstance(payload, dict) else payload or []):
-            if not isinstance(r, dict):
-                continue
-            route = r.get("Route") or r
-            if not isinstance(route, dict):
-                continue
-            if route.get("DestinationRegion") not in ("Europe", "EU"):
-                continue
-            # Carrier filter: only QR
-            if route.get("Carrier") and route.get("Carrier") != "QR":
-                continue
-            dest = route.get("DestinationAirport")
-            if dest and len(dest) == 3:
-                eu.add(dest)
-        # Keep list sane
+        if isinstance(data, list):
+            for r in data:
+                if not isinstance(r, dict):
+                    continue
+                route = r.get("Route") or r
+                if not isinstance(route, dict):
+                    continue
+                if route.get("DestinationRegion") != "Europe":
+                    continue
+                dest = route.get("DestinationAirport")
+                if dest and len(dest) == 3:
+                    eu.add(dest)
+        # Avoid ballooning to hundreds; intersect if needed
         if len(eu) > 60:
-            eu = eu.intersection(static) or set(static)
-        return sorted(eu) if eu else sorted(static)
+            eu = eu.intersection(static_list) or set(static_list)
+        return sorted(eu) if eu else list(static_list)
     except Exception as e:
         if DEBUG:
-            print(f"[routes] dynamic failed: {e}; falling back to static")
-        return sorted(static)
+            print("[routes] dynamic failed: {}; falling back to static".format(e))
+        return list(static_list)
 
 def seats_availability(origin, dest, start_date, end_date):
+    hdr = {
+        "Accept": "application/json",
+        "Partner-Authorization": SEATSAERO_API_KEY
+    }
     qs = urllib.parse.urlencode({
         "carrier": "QR",
         "origin": origin,
         "dest": dest,
         "start": start_date.isoformat(),
-        "end":   end_date.isoformat(),
+        "end": end_date.isoformat()
     })
-    url = f"{AVAIL_URL}?{qs}"
-    return _get(url)
+    url = "{}?{}".format(SEATSAERO_AVAIL_URL, qs)
+    resp = _get(url, hdr)
+    if isinstance(resp, dict) and "data" in resp:
+        return resp["data"]
+    return resp if isinstance(resp, list) else []
 
-def normalize_rows(payload):
-    if isinstance(payload, dict) and "data" in payload:
-        return payload["data"]
-    if isinstance(payload, list):
-        return payload
-    return []
+def is_premium_row(row):
+    # Only Business (J) / First (F)
+    return bool(row.get("JAvailable") or row.get("FAvailable"))
 
-def premium_qr_only(row):
-    # Enforce Business/First only; reject mixed-cabin
-    if not isinstance(row, dict):
-        return False
-    # Some feeds: booleans Y/W/J/F flags; others include cabin array
-    j = bool(row.get("JAvailable"))
-    f = bool(row.get("FAvailable"))
-    if not (j or f):
-        return False
-    # Mixed-cabin flag (if provided)
-    if row.get("MixedCabin") is True:
-        return False
-    # Carrier check if exposed
-    c = row.get("Carrier") or (row.get("Route", {}) if isinstance(row.get("Route"), dict) else {}).get("Carrier")
-    if c and c != "QR":
-        return False
-    return True
-
-def extract_price(row):
-    # Try to read Avios / Taxes from common keys; default high for sorting
-    avios = row.get("Avios") or row.get("MilesCost") or row.get("Points") or 10**9
-    taxes = row.get("Taxes") or row.get("Cash") or row.get("YQ") or 10**9
+def row_date(row):
+    # parsed as date
+    s = row.get("ParsedDate") or row.get("Date")
+    if not s:
+        return None
     try:
-        avios = int(avios)
+        # "2025-11-12T00:00:00Z" or "2025-11-12"
+        s2 = s.split("T")[0]
+        parts = s2.split("-")
+        return dt.date(int(parts[0]), int(parts[1]), int(parts[2]))
     except Exception:
-        avios = 10**9
-    try:
-        taxes = int(taxes)
-    except Exception:
-        taxes = 10**9
-    return avios, taxes
+        return None
 
-def outbound_dates_between(start: dt.date, months: int):
-    # produce month buckets of candidate days across the window
-    end_date = (start.replace(day=1) + dt.timedelta(days=32*months))
-    # cap to start + months with some buffer
-    hard_end = start + dt.timedelta(days=30*months + 14)
-    end = min(end_date, hard_end)
-    return start, end
+def row_avios(row):
+    # Try common fields; default high if missing to push down list
+    for k in ("Avios", "AviosPrice", "AviosCost", "Points", "AwardCost"):
+        if k in row:
+            try:
+                return int(row[k])
+            except Exception:
+                try:
+                    return int(float(row[k]))
+                except Exception:
+                    pass
+    return 10**9
 
-def flex_dates(d: dt.date, flex: int):
-    return [d + dt.timedelta(days=off) for off in range(-flex, flex+1)]
+def row_taxes(row):
+    for k in ("Taxes", "Cash", "CashCost"):
+        if k in row:
+            try:
+                return int(row[k])
+            except Exception:
+                try:
+                    return int(float(row[k]))
+                except Exception:
+                    pass
+    return 10**9
 
-def build_pairs(out_rows, ret_rows):
-    # Index return availability by date for quick lookup
-    ret_dates = defaultdict(list)  # date -> rows
-    for r in ret_rows:
-        try:
-            d = dt.date.fromisoformat(r.get("Date"))
-            ret_dates[d].append(r)
-        except Exception:
-            continue
+def nz_month_key(d: dt.date):
+    # "2025-11" for grouping
+    return "{}-{:02d}".format(d.year, d.month)
 
-    pairs = []
-    for o in out_rows:
-        try:
-            d_out = dt.date.fromisoformat(o.get("Date"))
-        except Exception:
-            continue
-        # return 28–35 days later, ± flex
-        for delta in range(MIN_RET_DAYS, MAX_RET_DAYS + 1):
-            target = d_out + dt.timedelta(days=delta)
-            for d in flex_dates(target, FLEX_DAYS):
-                if d in ret_dates:
-                    for r in ret_dates[d]:
-                        pairs.append((o, r))
-    return pairs
-
-def sweet_tag(avios):
+def sweet_badge(avios):
     if avios <= 90000:
         return "green"
-    elif avios < 100000:
-        return "orange"
-    return "grey"
+    if avios < 100000:
+        return "darkorange"
+    return "inherit"
 
-def ymd(s):
-    # lenient parse for either "YYYY-MM-DD" or already date
-    if isinstance(s, dt.date):
-        return s
-    return dt.date.fromisoformat(str(s))
+def booking_link(orig, dest, dep_date, ret_date, origin_home):
+    # Deep links change often; provide a stable search anchor to Qatar or BA.
+    # Use Qatar origin_home for outward and EU for return; users will refine dates.
+    base = "https://www.qatarairways.com/search"
+    params = {
+        "tripType": "RT" if ret_date else "OW",
+        "origin": origin_home,
+        "destination": dest,
+        "departureDate": dep_date.isoformat(),
+        "returnDate": ret_date.isoformat() if ret_date else ""
+    }
+    return "{}?{}".format(base, urllib.parse.urlencode(params))
 
-def month_groups(rows):
-    groups = defaultdict(list)
-    for row in rows:
-        d = ymd(row.get("Date"))
-        groups[month_key(d)].append(row)
-    # sort groups by date
-    ordered_keys = sorted(groups.keys(), key=lambda k: dt.datetime.strptime(k, "%B %Y"))
-    return [(k, groups[k]) for k in ordered_keys]
-
-def format_money(n):
-    if n >= 10**9:
-        return "—"
-    return f"{n:,}"
-
-def html_escape(s):
-    return html.escape(str(s or ""))
-
-def booking_link(origin, dest, date_iso):
-    # Shallow deeplink helper (placeholder to seats.aero search)
-    qs = urllib.parse.urlencode({
-        "carrier": "QR",
-        "origin": origin,
-        "dest": dest,
-        "date": date_iso,
-    })
-    return f"https://seats.aero/availability?{qs}"
-
-def render_html(pairs, subject):
-    # Group by outbound month, NZ date format; one table per month
-    # Prepare rows with ranking: min(out_avios, ret_avios) then min taxes
-    cooked = []
-    for (o, r) in pairs:
-        ao, to = extract_price(o)
-        ar, tr = extract_price(r)
-        ra = min(ao, ar)
-        rt = min(to, tr)
-        try:
-            d_out = ymd(o.get("Date"))
-            d_ret = ymd(r.get("Date"))
-        except Exception:
-            continue
-        cooked.append({
-            "rank": (ra, rt),
-            "out_date": d_out,
-            "ret_date": d_ret,
-            "out_orig": (o.get("Route", {}) or {}).get("OriginAirport") or o.get("Origin") or "DOH",
-            "out_dest": (o.get("Route", {}) or {}).get("DestinationAirport") or o.get("Dest") or "",
-            "ret_orig": (r.get("Route", {}) or {}).get("OriginAirport") or r.get("Origin") or "",
-            "ret_dest": (r.get("Route", {}) or {}).get("DestinationAirport") or r.get("Dest") or "DOH",
-            "out_avios": ao, "out_taxes": to,
-            "ret_avios": ar, "ret_taxes": tr,
-        })
-
-    cooked.sort(key=lambda x: x["rank"])
-
-    # Monthly buckets by outbound date
-    months = defaultdict(list)
-    for row in cooked:
-        months[month_key(row["out_date"])].append(row)
-
-    # Summary banner
-    best = cooked[0]["rank"][0] if cooked else None
-    if best is None:
-        summary_html = (
-            f"<p>No Business/First availability found for {html_escape(SCAN_ORIGIN)} ↔ EU in the configured window.</p>"
-        )
-        color = "grey"
-    else:
-        color = sweet_tag(best)
-        summary_html = (
-            f"<p><strong>Best one-way:</strong> "
-            f"<span style='color:{'green' if color=='green' else ('#cc8400' if color=='orange' else '#666')}'>"
-            f"{best:,} Avios</span> (lowest taxes next). "
-            f"Open-jaw allowed. Ranked by Avios → taxes.</p>"
-        )
-
-    # Build per-month tables
-    def th(s): return f"<th style='text-align:left;padding:8px;border-bottom:1px solid #ddd'>{html_escape(s)}</th>"
-    def td(s): return f"<td style='padding:8px;border-bottom:1px solid #eee'>{s}</td>"
-
-    tables = []
-    for mon in sorted(months.keys(), key=lambda k: dt.datetime.strptime(k, "%B %Y")):
-        rows = months[mon]
-        header = (
-            f"<h2 style='margin:16px 0 6px 0;font-family:Arial,Helvetica,sans-serif'>{html_escape(mon)}</h2>"
-            "<table style='border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;font-size:14px'>"
-            "<tr>"
-            f"{th('Route')}{th('Dates (Depart & Return)')}{th('Cabin')}{th('Avios')}{th('Taxes')}{th('Availability')}{th('Booking Link')}"
-            "</tr>"
-        )
-        body = []
-        for row in rows:
-            # choose better side (out vs ret) for Avios/Taxes display
-            if row["out_avios"] < row["ret_avios"] or (row["out_avios"] == row["ret_avios"] and row["out_taxes"] <= row["ret_taxes"]):
-                show_avios, show_taxes = row["out_avios"], row["out_taxes"]
-                cabin = "J/F"
-                dep = row["out_date"]
-                ret = row["ret_date"]
-                route = f"{row['out_orig']}→{row['out_dest']} / {row['ret_orig']}→{row['ret_dest']}"
-                link = booking_link(row["out_orig"], row["out_dest"], row["out_date"].isoformat())
-            else:
-                show_avios, show_taxes = row["ret_avios"], row["ret_taxes"]
-                cabin = "J/F"
-                dep = row["out_date"]
-                ret = row["ret_date"]
-                route = f"{row['out_orig']}→{row['out_dest']} / {row['ret_orig']}→{row['ret_dest']}"
-                link = booking_link(row["ret_orig"], row["ret_dest"], row["ret_date"].isoformat())
-
-            tag = sweet_tag(show_avios)
-            badge = {
-                "green":  "#008000",
-                "orange": "#cc8400",
-                "grey":   "#666666"
-            }[tag]
-
-            row_html = (
-    "<tr>"
-    f"{td(html_escape(route))}"
-    f"{td(nz_date(dep) + ' → ' + nz_date(ret))}"
-    f"{td(html_escape(cabin))}"
-    f"{td('<span style=\"color:{}\">{}</span>'.format(badge, format_money(show_avios)))}"
-    f"{td(format_money(show_taxes))}"
-    f"{td('Yes')}"
-    f"{td('<a href=\"{}\">Search</a>'.format(html_escape(link)))}"
-    "</tr>"
-)
-            body.append(row_html)
-        tables.append(header + "".join(body) + "</table>")
-
-    html_body = (
-        f"<h1 style='font-family:Arial,Helvetica,sans-serif;'>"
-        f"{html_escape(subject)}</h1>"
-        f"{summary_html}"
-        + ("" if tables else "<p>No qualifying pairs found.</p>")
-        + "".join(tables)
-    )
-    return html_body
-
-def persist_cache(new_pairs):
-    if DEDUP_DAYS <= 0:
-        return new_pairs
-    now = today_utc_date()
+def load_seen(path=".seen_hits.json", max_age_days=7):
     try:
-        with open(CACHE_PATH, "r", encoding="utf-8") as f:
-            cache = json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
     except Exception:
-        cache = {}
-
-    # build key per pair (route+dates+rank-ish)
-    def key_for(p):
-        o, r = p
-        kd = [
-            (o.get("Route",{}) or {}).get("OriginAirport") or o.get("Origin") or "",
-            (o.get("Route",{}) or {}).get("DestinationAirport") or o.get("Dest") or "",
-            o.get("Date",""),
-            (r.get("Route",{}) or {}).get("OriginAirport") or r.get("Origin") or "",
-            (r.get("Route",{}) or {}).get("DestinationAirport") or r.get("Dest") or "",
-            r.get("Date",""),
-        ]
-        return "|".join(kd)
-
-    # prune old entries
-    out_cache = {}
-    for k, stamp in cache.items():
+        return {}
+    # prune by age
+    cutoff = today_utc_date() - dt.timedelta(days=max_age_days)
+    out = {}
+    for k, v in data.items():
         try:
-            dt0 = dt.date.fromisoformat(stamp)
-            if (now - dt0).days <= DEDUP_DAYS:
-                out_cache[k] = stamp
+            ts = dt.date.fromisoformat(v.get("date", "1970-01-01"))
+            if ts >= cutoff:
+                out[k] = v
         except Exception:
-            continue
+            pass
+    return out
 
-    # filter pairs that are new/changed
-    filtered = []
-    seen_now = {}
-    for p in new_pairs:
-        k = key_for(p)
-        if k not in out_cache:
-            filtered.append(p)
-        seen_now[k] = now.isoformat()
-
-    out_cache.update(seen_now)
+def save_seen(d, path=".seen_hits.json"):
     try:
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(out_cache, f)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
     except Exception:
         pass
-    return filtered
 
-def post_webhook(subject, html_body):
-    if not WEBHOOK_URL:
-        return True, "skipped (no WEBHOOK_URL)"
-    payload = json.dumps({"subject": subject, "html": html_body, "alert": False}).encode("utf-8")
+def hit_key(orig, dest, dep, ret, cabin, avios, cash):
+    return "{}|{}|{}|{}|{}|{}|{}".format(orig, dest, dep.isoformat(), ret.isoformat() if ret else "", cabin, avios, cash)
+
+def render_html(grouped_rows, scan_origin, subject_date):
+    # Header + legend
+    parts = []
+    parts.append("<h1 style='font-family:Arial,Helvetica,sans-serif;'>Daily Qatar Avios EU Search \u2013 {}</h1>".format(subject_date))
+    parts.append("<p style='font-family:Arial,Helvetica,sans-serif;margin:6px 0;'>Origin: {} ({}). Business & First only. Ranked by Avios then cash.</p>".format(
+        scan_origin, airport_name(scan_origin)
+    ))
+    parts.append("<p style='font-family:Arial,Helvetica,sans-serif;margin:6px 0;'><span style='color:green;'>Green \u2264 90,000 Avios</span> \u2022 <span style='color:darkorange;'>Amber &lt; 100,000</span></p>")
+
+    if not grouped_rows:
+        parts.append("<p>No Business/First availability found for {} \u2194 EU in the configured window.</p>".format(html_escape(scan_origin)))
+        return "\n".join(parts)
+
+    # Per-month sections
+    month_keys = sorted(grouped_rows.keys())
+    for mk in month_keys:
+        rows = grouped_rows[mk]
+        # month heading like "November 2025"
+        y, m = mk.split("-")
+        month_name = dt.date(int(y), int(m), 1).strftime("%B %Y")
+        parts.append("<h2 style='font-family:Arial,Helvetica,sans-serif;margin:12px 0 6px 0;'>{}</h2>".format(html_escape(month_name)))
+
+        header = (
+            "<thead><tr>"
+            "{}{}{}{}{}{}{}"
+            "</tr></thead>".format(
+                th("Route"),
+                th("Dates (Depart \u2192 Return)"),
+                th("Cabin"),
+                th("Avios"),
+                th("Taxes (NZD)"),
+                th("Seats"),
+                th("Booking Link"),
+            )
+        )
+        body = []
+        for r in rows:
+            orig = r["orig"]
+            dest = r["dest"]
+            dep = r["dep"]
+            ret = r["ret"]
+            cabin = r["cabin"]
+            avios = r["avios"]
+            cash = r["cash"]
+            seats = r["seats"]
+            link = r["link"]
+
+            badge_color = sweet_badge(avios)
+            route_text = pretty_route(orig, dest)
+            dates_text = "{} \u2192 {}".format(nz_date(dep), nz_date(ret) if ret else "")
+            avios_html = "<span style='color:{}'>{}</span>".format(badge_color, format_money(avios))
+            link_html = "<a href='{}'>Search</a>".format(html_escape(link))
+
+            cells = []
+            cells.append(td(html_escape(route_text)))
+            cells.append(td(html_escape(dates_text)))
+            cells.append(td(html_escape(cabin)))
+            cells.append(td(avios_html))
+            cells.append(td(format_money(cash)))
+            cells.append(td(str(seats)))
+            cells.append(td(link_html))
+            body.append(tr("".join(cells)))
+
+        parts.append(table(header + "<tbody>{}</tbody>".format("".join(body))))
+
+    return "\n".join(parts)
+
+def send_brevo_rest(subject, html_body):
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY not set")
+    if not FROM_EMAIL or not TO_EMAIL:
+        raise RuntimeError("FROM_EMAIL/TO_EMAIL not set")
+
+    payload = {
+        "sender": {"email": FROM_EMAIL, "name": FROM_NAME or "Avios Bot"},
+        "to": [{"email": TO_EMAIL}],
+        "subject": subject,
+        "htmlContent": html_body,
+    }
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        WEBHOOK_URL, data=payload,
-        headers={"Content-Type":"application/json"},
+        "https://api.brevo.com/v3/smtp/email",
+        data=data,
+        headers={
+            "accept": "application/json",
+            "content-type": "application/json",
+            "api-key": BREVO_API_KEY
+        },
         method="POST"
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return (200 <= r.status < 300), f"http {r.status}"
-    except Exception as e:
-        return False, str(e)
+    if DEBUG:
+        print("[POST] Brevo /v3/smtp/email ({} bytes)".format(len(data)))
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = r.read()
+        if r.status // 100 != 2:
+            raise RuntimeError("Brevo non-2xx: {} {}".format(r.status, body.decode("utf-8")))
+        return body.decode("utf-8")
 
 def main():
-    ensure_env()
+    subject_date = today_utc_date().isoformat()
+    today = today_utc_date()
+    end = today + dt.timedelta(days=SCAN_MONTHS * 31)  # loose 15-month span
 
-    # Determine scan window
-    start = today_utc_date()
-    start, stop = outbound_dates_between(start, SCAN_MONTHS)
-    # For returns we’ll compute per-pair but also gather a big return window to index
-    start_ret = start + dt.timedelta(days=MIN_RET_DAYS - FLEX_DAYS)
-    stop_ret  = stop  + dt.timedelta(days=MAX_RET_DAYS + FLEX_DAYS)
+    # outbound window ± FLEX around dates within the span
+    out_start = today - dt.timedelta(days=FLEX_DAYS)
+    out_end   = end   + dt.timedelta(days=FLEX_DAYS)
 
-    # Destinations
-    EU_DESTS = routes_dynamic(STATIC_EU)
-    print(f"EU destinations: {len(EU_DESTS)} ({', '.join(EU_DESTS[:12])}…)" )
+    # return window offsets
+    ret_min = MIN_RET_DAYS
+    ret_max = MAX_RET_DAYS
 
-    # Outbound: DOH -> EU only (hub mode enforced)
-    out_rows = []
-    if USE_HUB_MODE:
-        out_origins = [SCAN_HUB]
-    else:
-        out_origins = [SCAN_ORIGIN]
+    # choose EU list
+    eu_list = seats_routes_qr_eu(EU_STATIC)
+    print("EU destinations: {} ({}…)".format(len(eu_list), ", ".join(eu_list[:12])))
 
-    for dest in EU_DESTS:
+    out_rows_raw = []
+    ret_rows_raw = []
+
+    # OUTBOUND: hub -> EU (QR metal)
+    out_origins = [SCAN_HUB] if USE_HUB_MODE else [SCAN_ORIGIN]
+    for dest in eu_list:
         for orig in out_origins:
             try:
-                payload = seats_availability(orig, dest, start, stop)
-                rows = normalize_rows(payload)
-                rows = [r for r in rows if premium_qr_only(r)]
-                out_rows.extend(rows)
+                rows = seats_availability(orig, dest, out_start, out_end)
+                out_rows_raw.extend(rows)
             except urllib.error.HTTPError as e:
-                print(f"HTTP {e.code} on {orig}->{dest}: {e.reason}")
-            except Exception as e:
-                print(f"ERR on {orig}->{dest}: {e}")
-            _sleep_ms(RATE_LIMIT_MS)
+                print("HTTP {} on {}->{}: {}".format(e.code, orig, dest, e.reason))
+            except Exception as ex:
+                print("Error {}->{}: {}".format(orig, dest, ex))
+            time.sleep(RATE_LIMIT_MS / 1000.0)
+    print("  … outbound queries complete")
 
-    # Return: EU -> DOH only (hub mode), NOT EU -> AKL
-    ret_rows = []
+    # RETURN: EU -> hub (QR metal)
     ret_dest = SCAN_HUB if USE_HUB_MODE else SCAN_ORIGIN
-    for orig in EU_DESTS:
+    for orig in eu_list:
         try:
-            payload = seats_availability(orig, ret_dest, start_ret, stop_ret)
-            rows = normalize_rows(payload)
-            rows = [r for r in rows if premium_qr_only(r)]
-            ret_rows.extend(rows)
+            ret_start = out_start + dt.timedelta(days=ret_min)
+            ret_end   = out_end   + dt.timedelta(days=ret_max)
+            rows = seats_availability(orig, ret_dest, ret_start, ret_end)
+            ret_rows_raw.extend(rows)
         except urllib.error.HTTPError as e:
-            print(f"HTTP {e.code} on {orig}->{ret_dest}: {e.reason}")
-        except Exception as e:
-            print(f"ERR on {orig}->{ret_dest}: {e}")
-        _sleep_ms(RATE_LIMIT_MS)
+            print("HTTP {} on {}->{}: {}".format(e.code, orig, ret_dest, e.reason))
+        except Exception as ex:
+            print("Error {}->{}: {}".format(orig, ret_dest, ex))
+        time.sleep(RATE_LIMIT_MS / 1000.0)
+    print("  … return queries complete")
 
-    print(f"Scanned rows: OUT={len(out_rows)} ; RET={len(ret_rows)}")
+    # Normalize / filter premium only
+    out_rows = []
+    for r in out_rows_raw:
+        if not is_premium_row(r):
+            continue
+        d = row_date(r)
+        if not d:
+            continue
+        cabin = "First" if r.get("FAvailable") else "Business"
+        out_rows.append({
+            "orig": r.get("Route", {}).get("OriginAirport", r.get("OriginAirport", out_origins[0])),
+            "dest": r.get("Route", {}).get("DestinationAirport", r.get("DestinationAirport")),
+            "date": d,
+            "cabin": cabin,
+            "avios": row_avios(r),
+            "cash": row_taxes(r),
+            "seats": int(r.get("Seats", 1))
+        })
 
-    # Pair (open-jaw okay)
-    raw_pairs = build_pairs(out_rows, ret_rows)
-    print(f"Paired (open-jaw allowed): {len(raw_pairs)}")
+    ret_rows = []
+    for r in ret_rows_raw:
+        if not is_premium_row(r):
+            continue
+        d = row_date(r)
+        if not d:
+            continue
+        cabin = "First" if r.get("FAvailable") else "Business"
+        ret_rows.append({
+            "orig": r.get("Route", {}).get("OriginAirport", r.get("OriginAirport")),
+            "dest": r.get("Route", {}).get("DestinationAirport", r.get("DestinationAirport", ret_dest)),
+            "date": d,
+            "cabin": cabin,
+            "avios": row_avios(r),
+            "cash": row_taxes(r),
+            "seats": int(r.get("Seats", 1))
+        })
 
-    # Dedup last N days
-    pairs = persist_cache(raw_pairs)
-    if DEDUP_DAYS > 0:
-        print(f"After {DEDUP_DAYS}-day dedup: {len(pairs)}")
-    else:
-        print("Dedup disabled.")
+    print("Scanned rows: OUT={} ; RET={}".format(len(out_rows), len(ret_rows)))
 
-    # Render HTML (NZ date grouping per month)
-    subject = f"Daily Qatar Avios EU Search – {today_utc_date().isoformat()}"
-    html_body = render_html(pairs, subject)
+    # Pairing logic (open-jaw allowed): we only require both legs exist within 28–35 days window
+    pairs = []
+    # Build index by destination for outbound and origin for return
+    out_by_dest = defaultdict(list)
+    for o in out_rows:
+        out_by_dest[o["dest"]].append(o)
 
-    # Write out.html
+    ret_by_orig = defaultdict(list)
+    for r in ret_rows:
+        ret_by_orig[r["orig"]].append(r)
+
+    for eu in eu_list:
+        outs = out_by_dest.get(eu, [])
+        rets = ret_by_orig.get(eu, [])
+        if not outs or not rets:
+            continue
+        for o in outs:
+            for r in rets:
+                # return between min/max days after outbound
+                delta = (r["date"] - o["date"]).days
+                if delta < MIN_RET_DAYS or delta > MAX_RET_DAYS:
+                    continue
+                # cabin must match or prefer the lower cabin label (exclude mixed)
+                if o["cabin"] != r["cabin"]:
+                    continue
+                total_avios = o["avios"] + r["avios"]
+                total_cash = o["cash"] + r["cash"]
+                seats = min(o["seats"], r["seats"])
+                link = booking_link(SCAN_HUB, eu, o["date"], r["date"], SCAN_ORIGIN)
+                pairs.append({
+                    "orig": SCAN_ORIGIN,
+                    "dest": eu,
+                    "dep": o["date"],
+                    "ret": r["date"],
+                    "cabin": o["cabin"],
+                    "avios": total_avios,
+                    "cash": total_cash,
+                    "seats": seats,
+                    "link": link
+                })
+
+    # Sort by avios then cash
+    pairs.sort(key=lambda x: (x["avios"], x["cash"]))
+    print("Paired (open-jaw allowed): {}".format(len(pairs)))
+
+    # De-dup (7-day memory)
+    seen = load_seen(max_age_days=DEDUP_DAYS)
+    fresh = []
+    today_iso = today.isoformat()
+    for p in pairs:
+        k = hit_key(p["orig"], p["dest"], p["dep"], p["ret"], p["cabin"], p["avios"], p["cash"])
+        if k in seen:
+            continue
+        seen[k] = {"date": today_iso}
+        fresh.append(p)
+
+    print("After {}-day dedup (if enabled): {}".format(DEDUP_DAYS, len(fresh)))
+
+    # Group by month (NZ)
+    grouped = defaultdict(list)
+    for p in fresh:
+        mk = nz_month_key(p["dep"])
+        grouped[mk].append(p)
+
+    # Build HTML
+    subject = "Daily Qatar Avios EU Search \u2013 {}".format(subject_date)
+    html = render_html(grouped, SCAN_ORIGIN, subject_date)
+
+    # Always write a local preview
     try:
-        with open(OUT_HTML, "w", encoding="utf-8") as f:
-            f.write(html_body)
-        print(f"Wrote {OUT_HTML}")
+        with open("out.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print("Wrote out.html")
     except Exception as e:
-        print(f"❌ Failed to write HTML: {e}")
+        print("Failed to write out.html: {}".format(e))
+
+    # Save dedup memory
+    save_seen(seen)
 
     # Delivery
     if DRY_RUN:
-        print("DRY_RUN=1: skip webhook/email delivery.")
-    else:
-        ok, info = post_webhook(subject, html_body)
-        if not ok:
-            print(f"❌ Webhook delivery failed: {info}")
-        else:
-            print(f"✅ Webhook delivered: {info}")
+        print("DRY_RUN=1: skip email delivery.")
+        print(subject)
+        print()
+        print(html)
+        return
 
-    # Console preview
-    print(subject, end="\n\n")
-    # Keep output short in console
-    preview = html_body if len(html_body) < 2000 else html_body[:2000] + "…"
-    print(preview)
+    # Brevo REST
+    try:
+        resp = send_brevo_rest(subject, html)
+        if DEBUG:
+            print("Brevo response: {}".format(resp))
+    except Exception as e:
+        print("❌ Brevo email failed: {}".format(e))
+        raise
 
 if __name__ == "__main__":
-    if not SEATSAERO_API_KEY:
-        print("❌ Required env var missing: SEATSAERO_API_KEY")
-        sys.exit(1)
     try:
         main()
-    except KeyboardInterrupt:
-        sys.exit(130)
+    except SystemExit as se:
+        print(se)
+        sys.exit(1)
+    except urllib.error.HTTPError as he:
+        print("HTTP {} {}: {}".format(he.code, he.reason, getattr(he, "url", "")))
+        sys.exit(1)
+    except Exception as ex:
+        print("💥 Error:", ex)
+        sys.exit(1)
