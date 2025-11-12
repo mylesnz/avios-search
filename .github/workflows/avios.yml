@@ -13,27 +13,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show repo tree (top level)
-        run: |
-          pwd
-          ls -la
-          echo "---- .github/workflows ----"
-          ls -la .github/workflows || true
-
       - name: Confirm script exists
         run: |
-          test -f "seats_avios_daily.py" || (echo "ERROR: seats_avios_daily.py not found at repo root" && exit 1)
-          sed -n '1,40p' seats_avios_daily.py || true
+          if [ ! -f "seats_avios_daily.py" ]; then
+            echo "❌ seats_avios_daily.py not found at repo root"
+            exit 1
+          fi
+          echo "✅ seats_avios_daily.py found"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Python version
+      - name: Verify Python
         run: python -V
 
-      - name: Check required secrets are present
+      - name: Check required secrets
         env:
           SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
           SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
@@ -45,35 +41,57 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
           missing=0
-          for k in SEATSAERO_API_KEY SEATSAERO_AVAIL_URL FROM_EMAIL TO_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS; do
-            v=$(printenv $k)
-            if [ -z "$v" ]; then
-              echo "❌ Missing secret: $k"
+          for key in SEATSAERO_API_KEY SEATSAERO_AVAIL_URL FROM_EMAIL TO_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS; do
+            if [ -z "$(printenv "$key")" ]; then
+              echo "❌ Missing secret: $key"
               missing=1
             else
-              echo "✅ $k present"
+              echo "✅ $key present"
             fi
           done
           if [ $missing -ne 0 ]; then
-            echo "One or more required secrets are missing. Add them in Repo → Settings → Secrets → Actions."
+            echo "Some required secrets are missing. Add them under Repo → Settings → Secrets → Actions."
             exit 1
           fi
 
-      - name: Install dependencies (none needed; keep pip fresh)
+      - name: DNS + SMTP sanity check
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: |
+          python - <<'PY'
+          import os, socket, sys
+          host = os.environ['SMTP_HOST'].strip()
+          port = int(os.environ.get('SMTP_PORT','587'))
+          print("SMTP_HOST repr:", repr(host), "SMTP_PORT:", port)
+          try:
+              socket.getaddrinfo(host, port)
+              s = socket.socket(); s.settimeout(10); s.connect((host, port)); s.close()
+              print("✅ SMTP TCP connect OK")
+          except Exception as e:
+              print("❌ SMTP check failed:", e); sys.exit(1)
+          PY
+
+      - name: Install pip (no extra deps required)
         run: python -m pip install --upgrade pip
 
       - name: Run Avios daily script
         env:
+          # --- Seats.aero configuration ---
           SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
           SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
           SEATSAERO_ROUTES_URL: ${{ secrets.SEATSAERO_ROUTES_URL }}
+
+          # --- Email (Brevo SMTP) configuration ---
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           TO_EMAIL:   ${{ secrets.TO_EMAIL }}
           SMTP_HOST:  ${{ secrets.SMTP_HOST }}
           SMTP_PORT:  ${{ secrets.SMTP_PORT }}
           SMTP_USER:  ${{ secrets.SMTP_USER }}
           SMTP_PASS:  ${{ secrets.SMTP_PASS }}
+
+          # Optional friendly name
           FROM_NAME:  "Qatar Avios Bot"
         run: |
-          echo "Running seats_avios_daily.py ..."
+          echo "🚀 Running seats_avios_daily.py ..."
           python seats_avios_daily.py
