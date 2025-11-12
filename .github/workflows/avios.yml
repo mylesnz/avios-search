@@ -1,19 +1,36 @@
 name: Daily Qatar Avios EU Email
 
 on:
-  schedule:
-    - cron: "0 18 * * *"   # ~07:00 NZT daily
   workflow_dispatch:
+  schedule:
+    # 16:30 UTC = 05:30 NZDT (adjust if you want a different send time)
+    - cron: "30 16 * * *"
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
+    env:
+      # ===== Required secrets (set these in: Repo → Settings → Secrets and variables → Actions) =====
+      SEATSAERO_API_KEY:     ${{ secrets.SEATSAERO_API_KEY }}
+      SEATSAERO_AVAIL_URL:   ${{ secrets.SEATSAERO_AVAIL_URL }}
+      SEATSAERO_ROUTES_URL:  ${{ secrets.SEATSAERO_ROUTES_URL }}
+
+      FROM_EMAIL:            ${{ secrets.FROM_EMAIL }}
+      FROM_NAME:             ${{ secrets.FROM_NAME }}   # e.g. "Avios Alerts"
+      TO_EMAIL:              ${{ secrets.TO_EMAIL }}
+
+      SMTP_HOST:             ${{ secrets.SMTP_HOST }}   # smtp-relay.brevo.com
+      SMTP_PORT:             ${{ secrets.SMTP_PORT }}   # 587
+      SMTP_USER:             ${{ secrets.SMTP_USER }}   # your Brevo SMTP login (xxxx@smtp-brevo.com)
+      SMTP_PASS:             ${{ secrets.SMTP_PASS }}   # xkeysib-... (Brevo SMTP key)
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Confirm script exists
+      - name: Ensure seats_avios_daily.py exists
+        shell: bash
         run: |
           if [ ! -f "seats_avios_daily.py" ]; then
             echo "❌ seats_avios_daily.py not found at repo root"
@@ -26,19 +43,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Verify Python
+      - name: Python version
         run: python -V
 
+      # 0) Secret presence check
       - name: Check required secrets
-        env:
-          SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
-          SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
-          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        shell: bash
         run: |
           missing=0
           for key in SEATSAERO_API_KEY SEATSAERO_AVAIL_URL FROM_EMAIL TO_EMAIL SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS; do
@@ -54,10 +64,8 @@ jobs:
             exit 1
           fi
 
+      # 1) DNS + TCP reachability for SMTP
       - name: DNS + SMTP sanity check
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
           python - <<'PY'
           import os, socket, sys
@@ -66,32 +74,59 @@ jobs:
           print("SMTP_HOST repr:", repr(host), "SMTP_PORT:", port)
           try:
               socket.getaddrinfo(host, port)
-              s = socket.socket(); s.settimeout(10); s.connect((host, port)); s.close()
+              s = socket.socket()
+              s.settimeout(10)
+              s.connect((host, port))
+              s.close()
               print("✅ SMTP TCP connect OK")
           except Exception as e:
               print("❌ SMTP check failed:", e); sys.exit(1)
           PY
 
-      - name: Install pip (no extra deps required)
+      # 2) Explicit SMTP AUTH check (Brevo)
+      - name: SMTP auth check (Brevo)
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        run: |
+          python - <<'PY'
+          import os, smtplib, sys
+          host = os.environ["SMTP_HOST"].strip()
+          port = int(os.environ.get("SMTP_PORT","587"))
+          user = os.environ["SMTP_USER"]
+          pw   = os.environ["SMTP_PASS"]
+
+          # fast validation of obvious copy/paste issues
+          for label, val in (("SMTP_USER", user), ("SMTP_PASS", pw)):
+              if not val or val.strip() != val:
+                  print(f"❌ {label} has leading/trailing whitespace")
+                  sys.exit(1)
+              try:
+                  val.encode("ascii")
+              except UnicodeEncodeError:
+                  print(f"❌ {label} contains non-ASCII (smart quotes or hidden chars)")
+                  sys.exit(1)
+
+          try:
+              with smtplib.SMTP(host, port, timeout=20) as s:
+                  s.starttls()
+                  s.login(user, pw)
+              print("✅ SMTP auth OK")
+          except smtplib.SMTPAuthenticationError as e:
+              print(f"❌ SMTP auth failed: {e.smtp_code} {e.smtp_error!r}")
+              print("Hint: Use a fresh **Brevo SMTP key** (starts with xkeysib-...) for SMTP_PASS, and the Brevo SMTP login for SMTP_USER.")
+              sys.exit(1)
+          except Exception as e:
+              print("❌ SMTP error:", repr(e)); sys.exit(1)
+          PY
+
+      - name: Upgrade pip (no extra deps needed)
         run: python -m pip install --upgrade pip
 
+      # 3) Run your job script
       - name: Run Avios daily script
-        env:
-          # --- Seats.aero configuration ---
-          SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
-          SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
-          SEATSAERO_ROUTES_URL: ${{ secrets.SEATSAERO_ROUTES_URL }}
-
-          # --- Email (Brevo SMTP) configuration ---
-          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          TO_EMAIL:   ${{ secrets.TO_EMAIL }}
-          SMTP_HOST:  ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:  ${{ secrets.SMTP_PORT }}
-          SMTP_USER:  ${{ secrets.SMTP_USER }}
-          SMTP_PASS:  ${{ secrets.SMTP_PASS }}
-
-          # Optional friendly name
-          FROM_NAME:  "Qatar Avios Bot"
         run: |
           echo "🚀 Running seats_avios_daily.py ..."
           python seats_avios_daily.py
