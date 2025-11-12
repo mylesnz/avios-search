@@ -1,43 +1,57 @@
 name: Avios Daily
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 18 * * *" # 6 PM UTC = 7 AM NZDT
-  workflow_dispatch:
+    # Runs daily at 06:45 New Zealand time (approx) -> 17:45 UTC previous day.
+    # Adjust for DST as needed.
+    - cron: "45 17 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   avios-check:
-    runs-on: ubuntu-latest
-    env:
-      SEATSAERO_API_KEY:     ${{ secrets.SEATSAERO_API_KEY }}
-      SEATSAERO_AVAIL_URL:   ${{ secrets.SEATSAERO_AVAIL_URL }}
-      SEATSAERO_ROUTES_URL:  ${{ secrets.SEATSAERO_ROUTES_URL }}
-      BREVO_API_KEY:         ${{ secrets.BREVO_API_KEY }}
-      FROM_EMAIL:            ${{ secrets.FROM_EMAIL }}
-      FROM_NAME:             ${{ secrets.FROM_NAME }}
-      TO_EMAIL:              ${{ secrets.TO_EMAIL }}
+    name: Run Qatar Avios scan and email
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      # (Optional) Show key environment versions for debugging
+      - name: Show runtime context
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python3 --version
+          uname -a
+          date -u
 
-      - name: Show effective endpoints
-        run: |
-          echo "✅ Using endpoints:"
-          echo "  AVAIL_URL=${SEATSAERO_AVAIL_URL:-https://seats.aero/partnerapi/availability}"
-          echo "  ROUTES_URL=${SEATSAERO_ROUTES_URL:-https://seats.aero/partnerapi/routes}"
+      - name: Run Seats.aero → Brevo email
+        env:
+          # ---- Seats.aero (required) ----
+          SEATSAERO_API_KEY:   ${{ secrets.SEATSAERO_API_KEY }}
+          SEATSAERO_AVAIL_URL: ${{ secrets.SEATSAERO_AVAIL_URL }}
+          SEATSAERO_ROUTES_URL:${{ secrets.SEATSAERO_ROUTES_URL }}
 
-      - name: Run Avios availability search
+          # ---- Brevo REST (preferred) ----
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          FROM_EMAIL:    ${{ secrets.FROM_EMAIL }}
+          FROM_NAME:     ${{ secrets.FROM_NAME }}
+          TO_EMAIL:      ${{ secrets.TO_EMAIL }}
+
+          # ---- Optional SMTP fallback (only used if Brevo REST not set) ----
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+
+          # ---- Testing switch (set repo variable DRY_RUN=1 to skip sending) ----
+          DRY_RUN: ${{ vars.DRY_RUN }}
         run: |
-          echo "🚀 Running Seats.aero → Brevo integration..."
-          python seats_avios_daily.py
+          echo "🚀 Running Seats.aero → Brevo..."
+          python3 seats_avios_daily.py
