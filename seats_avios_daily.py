@@ -1,394 +1,342 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Daily Qatar Avios EU finder + emailer.
 
-import os, sys, json, smtplib, ssl, socket, datetime as dt
-from typing import List, Dict, Any, Tuple
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import urllib.request, urllib.error
+Environment:
+  # Seats.aero
+  SEATSAERO_API_KEY      = pro_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  SEATSAERO_ROUTES_URL   = https://seats.aero/partnerapi/routes?carrier=QR&region=EU
+  SEATSAERO_AVAIL_URL    = https://seats.aero/partnerapi/availability
 
-# =======================
-# Config via environment
-# =======================
-SEATSAERO_API_KEY   = os.getenv("SEATSAERO_API_KEY", "").strip()
-AVAIL_URL           = os.getenv("SEATSAERO_AVAIL_URL", "").strip()  # e.g. https://partners.seats.aero/v1/availability/bulk
-ROUTES_URL          = os.getenv("SEATSAERO_ROUTES_URL", "").strip() # e.g. https://partners.seats.aero/v1/routes?carrier=QR&region=EU
-FROM_EMAIL          = os.getenv("FROM_EMAIL", "").strip()
-FROM_NAME          = os.getenv("FROM_NAME", "Qatar Avios Bot").strip()
-TO_EMAIL            = os.getenv("TO_EMAIL", "").strip()
-SMTP_HOST           = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT           = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER           = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS           = os.getenv("SMTP_PASS", "").strip()
+  # Query window (optional; defaults = today → +45 days)
+  OUTBOUND_START         = 2026-02-01
+  OUTBOUND_END           = 2026-02-28
+  ORIGIN                 = AKL
+  CARRIER                = QR
 
-# Search parameters
-ORIGIN              = "AKL"
-CARRIER             = "QR"
-TODAY               = dt.date.today()
-END_DATE            = TODAY + dt.timedelta(days=31*15)   # ~15 months
-RETURN_MIN_DAYS     = 28
-RETURN_MAX_DAYS     = 35
-FLEX_DAYS           = 3
-CABINS              = ["business", "first"]
-EXCLUDE_MIXED       = True
-SWEET_SPOT_BUS_OJ   = 90_000
+  # Email (Brevo REST preferred)
+  FROM_EMAIL             = you@imoffto.xyz
+  TO_EMAIL               = you@example.com
+  FROM_NAME              = Avios Alerts
+  BREVO_API_KEY          = xkeysib_...   # <-- REST API key (works even if SMTP blocked)
 
-# De-dupe cache (best effort)
-CACHE_FILE          = ".avios_last.json"
+  # Optional SMTP fallback (only if you insist)
+  SMTP_HOST              = smtp-relay.brevo.com
+  SMTP_PORT              = 587
+  SMTP_USER              = apikey
+  SMTP_PASS              = xsmtpsib-...  # <-- SMTP key, different from xkeysib
+"""
 
-# Fallback EU QR destinations (kept conservative; adjust as needed)
-FALLBACK_EU_QR = [
-    "AMS","ATH","BCN","BEG","BER","BHX","BLQ","BRU","BUD","CDG","CPH","DUB",
-    "DUS","EDI","FCO","FRA","GOT","HEL","IST","LIS","LUX","LYS","MAD","MAN",
-    "MRS","MUC","MXP","NCE","OSL","OTP","PMI","PRG","RIX","SOF","SPU","STR",
-    "TLL","VCE","VIE","WAW","ZAG","ZRH"
+import json
+import os
+import ssl
+import sys
+import time
+import smtplib
+import urllib.parse
+import urllib.request
+from datetime import date, timedelta
+
+# ---------- Helpers ----------
+
+def getenv_str(name, default=None, required=False):
+    v = os.environ.get(name, default)
+    if required and (v is None or str(v).strip() == ""):
+        die(f"Required env var missing: {name}")
+    return v.strip() if isinstance(v, str) else v
+
+def die(msg, code=1):
+    print(f"❌ {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def log(msg):
+    print(msg, flush=True)
+
+def is_partner_api(url: str) -> bool:
+    # Seats.aero Partner API lives under /partnerapi/...
+    return "/partnerapi/" in url
+
+def auth_headers(url: str, api_key: str) -> dict:
+    # Partner API uses 'Partner-Authorization: Bearer <key>'
+    if is_partner_api(url):
+        return {
+            "Accept": "application/json",
+            "Partner-Authorization": f"Bearer {api_key}",
+            "User-Agent": "avios-search/1.0"
+        }
+    # Generic (non-partner) APIs (kept for completeness)
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "avios-search/1.0"
+    }
+
+def http_get_json(url: str, headers: dict, timeout=30, retries=2):
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if r.status != 200:
+                    body = r.read().decode("utf-8", "ignore")
+                    raise RuntimeError(f"HTTP {r.status} → {body[:200]}")
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            last = e
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise last
+
+def http_post_json(url: str, headers: dict, payload: dict, timeout=30, retries=1):
+    last = None
+    data = json.dumps(payload).encode("utf-8")
+    hdrs = dict(headers)
+    hdrs.setdefault("Content-Type", "application/json")
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=hdrs, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if r.status not in (200, 201, 202):
+                    body = r.read().decode("utf-8", "ignore")
+                    raise RuntimeError(f"HTTP {r.status} → {body[:200]}")
+                txt = r.read().decode("utf-8") if r.length else "{}"
+                return json.loads(txt) if txt else {}
+        except Exception as e:
+            last = e
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise last
+
+# ---------- Seats.aero logic ----------
+
+FALLBACK_EU_DESTS = [
+    # Common EU hubs; routes endpoint can refine when available
+    "LHR", "LGW", "MAN", "CDG", "AMS", "FRA", "MUC", "DUS",
+    "MAD", "BCN", "ZRH", "VIE", "CPH", "ARN", "OSL", "BRU",
+    "DUB", "LIS", "PRG", "WAW", "ATH", "MXP", "FCO"
 ]
 
-# =======================
-# Utilities
-# =======================
+def load_window():
+    # default: today → +45 days
+    start = getenv_str("OUTBOUND_START")
+    end = getenv_str("OUTBOUND_END")
+    def fmt(d): return d.strftime("%Y-%m-%d")
+    if not start:
+        start = fmt(date.today())
+    if not end:
+        end = fmt(date.today() + timedelta(days=45))
+    return start, end
 
-def fail(msg: str) -> None:
-    print(msg, file=sys.stderr); sys.exit(1)
-
-def needs(k: str) -> None:
-    if not globals()[k]:
-        fail(f"Required configuration missing: {k}")
-
-def check_env() -> None:
-    for k in ("SEATSAERO_API_KEY","AVAIL_URL","FROM_EMAIL","TO_EMAIL","SMTP_HOST","SMTP_USER","SMTP_PASS"):
-        needs(k)
-    # ROUTES_URL is optional (we fall back if missing)
-
-def seats_headers() -> Dict[str,str]:
-    return {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Partner-Authorization": f"Bearer {SEATSAERO_API_KEY}",
-        "User-Agent": "avios-eu-bot/1.0"
-    }
-
-def http_get_json(url: str, headers: Dict[str, str]) -> Any:
-    req = urllib.request.Request(url, headers=headers, method="GET")
+def fetch_eu_destinations(routes_url: str, api_key: str) -> list[str]:
+    if not routes_url:
+        log("ℹ️ No SEATSAERO_ROUTES_URL set; using fallback EU list.")
+        return FALLBACK_EU_DESTS
+    headers = auth_headers(routes_url, api_key)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"GET {url} -> {e.code} {e.reason}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"GET {url} -> {e.reason}")
-
-def http_post_json(url: str, headers: Dict[str, str], payload: Any) -> Any:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"POST {url} -> {e.code} {e.reason}\n{body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"POST {url} -> {e.reason}")
-
-def date_range(start: dt.date, end: dt.date, step_days: int) -> List[dt.date]:
-    out, cur = [], start
-    while cur <= end:
-        out.append(cur)
-        cur += dt.timedelta(days=step_days)
-    return out
-
-# =======================
-# Routes → EU QR destinations
-# =======================
-
-def fetch_qr_eu_destinations() -> List[str]:
-    if not ROUTES_URL:
-        print("ROUTES_URL not set; using fallback EU list.")
-        return FALLBACK_EU_QR[:]
-    try:
-        print("Fetching QR EU destinations from routes endpoint …")
-        data = http_get_json(ROUTES_URL, seats_headers())
+        log("🔎 Fetching EU destinations from routes endpoint …")
+        data = http_get_json(routes_url, headers)
+        # expected shape: [{"origin":"DOH","destination":"CDG","carrier":"QR",...}, ...]
+        dests = sorted({row.get("destination","").upper() for row in data if row.get("destination")})
+        if not dests:
+            raise ValueError("Routes response empty")
+        log(f"✅ Got {len(dests)} EU destinations from routes")
+        return dests
     except Exception as e:
-        print(f"Routes endpoint unavailable ({e}); using fallback EU list.")
-        return FALLBACK_EU_QR[:]
+        log(f"⚠️ Routes fetch failed ({e}); falling back to static EU list.")
+        return FALLBACK_EU_DESTS
 
-    dests = set()
-    def add(dst: str):
-        dst = (dst or "").strip().upper()
-        if dst and dst != ORIGIN: dests.add(dst)
+def query_availability(avail_url: str, api_key: str, carrier: str, origin: str,
+                       destinations: list[str], start: str, end: str) -> list[dict]:
+    """
+    Partner API supports GET with query params:
+      /partnerapi/availability?carrier=QR&origin=AKL&dest=CDG&start=YYYY-MM-DD&end=YYYY-MM-DD
+    We'll loop destinations (keeps responses small & avoids CF issues).
+    """
+    headers = auth_headers(avail_url, api_key)
+    results = []
+    for dest in destinations:
+        q = {
+            "carrier": carrier,
+            "origin":  origin,
+            "dest":    dest,
+            "start":   start,
+            "end":     end
+        }
+        url = f"{avail_url}?{urllib.parse.urlencode(q)}"
+        try:
+            data = http_get_json(url, headers)
+            # expected shape: list of flights / objects; we pass through fields we care about
+            for row in data or []:
+                row["destination"] = dest  # just in case
+            results.extend(data or [])
+            time.sleep(0.1)  # be polite to CF
+        except Exception as e:
+            log(f"⚠️ Availability GET failed for {dest}: {e}")
+    return results
 
-    if isinstance(data, dict) and "routes" in data:
-        for r in data["routes"]:
-            add(r.get("destination"))
-    elif isinstance(data, list):
-        for r in data:
-            add(r.get("destination"))
-    else:
-        # Best effort: scan for keys named "destination"
-        def walk(obj):
-            if isinstance(obj, dict):
-                if "destination" in obj: add(obj["destination"])
-                for v in obj.values(): walk(v)
-            elif isinstance(obj, list):
-                for v in obj: walk(v)
-        walk(data)
+# ---------- Email (Brevo REST preferred) ----------
 
-    dest_list = sorted(dests)
-    if not dest_list:
-        print("Routes returned no destinations; using fallback EU list.")
-        return FALLBACK_EU_QR[:]
-    print(f"Found {len(dest_list)} EU destinations via routes.")
-    return dest_list
+def send_email_brevo_rest(subject: str, html: str) -> None:
+    api_key = getenv_str("BREVO_API_KEY")
+    if not api_key:
+        raise RuntimeError("BREVO_API_KEY not set (needed for REST send).")
 
-# =======================
-# Build availability queries
-# =======================
-
-def generate_search_queries(destinations: List[str]) -> Dict[str, Any]:
-    # Build outbound windows every 14 days with ±FLEX_DAYS; return 28–35 days later (±FLEX_DAYS).
-    windows = []
-    for outbound_start in date_range(TODAY, END_DATE, step_days=14):
-        outbound_end = outbound_start + dt.timedelta(days=FLEX_DAYS)
-        ret_min = outbound_start + dt.timedelta(days=RETURN_MIN_DAYS - FLEX_DAYS)
-        ret_max = outbound_start + dt.timedelta(days=RETURN_MAX_DAYS + FLEX_DAYS)
-        windows.append({
-            "outbound": {"start": outbound_start.isoformat(), "end": outbound_end.isoformat()},
-            "return":   {"start": ret_min.isoformat(),       "end": ret_max.isoformat()},
-        })
-
-    # Bulk payload; schema may vary per partner contract—this pragmatic shape works with typical “bulk availability”.
-    queries = []
-    for w in windows:
-        queries.append({
-            "origin": ORIGIN,
-            "destinations": destinations,  # any EU QR city for open-jaw out/back
-            "outbound": w["outbound"],
-            "return":   w["return"],
-        })
+    from_email = getenv_str("FROM_EMAIL", required=True)
+    from_name  = getenv_str("FROM_NAME", "Avios Alerts")
+    to_email   = getenv_str("TO_EMAIL", required=True)
 
     payload = {
-        "carrier": CARRIER,
-        "filters": {
-            "cabins": CABINS,
-            "avoid_mixed_cabin": EXCLUDE_MIXED,
-            "points_only": True  # Avios only; cash allowed only for taxes
-        },
-        "queries": queries
+        "sender": {"email": from_email, "name": from_name},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html
     }
-    return payload
+    log("📮 Sending via Brevo REST /v3/smtp/email …")
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "api-key": api_key
+    }
+    # Using our http_post_json helper
+    _ = http_post_json(url, headers, payload, timeout=30, retries=0)
+    log("✅ Brevo REST send accepted")
 
-# =======================
-# Parse + rank results
-# =======================
+def send_email_smtp(subject: str, html: str) -> None:
+    host = getenv_str("SMTP_HOST", required=True)
+    port = int(getenv_str("SMTP_PORT", "587"))
+    user = getenv_str("SMTP_USER", required=True)
+    pw   = getenv_str("SMTP_PASS", required=True)
+    from_email = getenv_str("FROM_EMAIL", required=True)
+    from_name  = getenv_str("FROM_NAME", "Avios Alerts")
+    to_email   = getenv_str("TO_EMAIL", required=True)
 
-def parse_results(raw: Any) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    if not raw: return rows
+    msg = f"From: {from_name} <{from_email}>\r\n" \
+          f"To: <{to_email}>\r\n" \
+          f"Subject: {subject}\r\n" \
+          f"MIME-Version: 1.0\r\n" \
+          f"Content-Type: text/html; charset=UTF-8\r\n\r\n{html}"
 
-    blobs = raw.get("results", raw) if isinstance(raw, dict) else raw
-    if not isinstance(blobs, list): blobs = [blobs]
-
-    def to_int(v):
-        try:
-            return int(v)
-        except Exception:
-            try:
-                return int(float(v))
-            except Exception:
-                return None
-
-    for item in blobs:
-        try:
-            origin = (item.get("origin") or ORIGIN).upper()
-            dest   = (item.get("destination") or "").upper()
-            depart = (item.get("outbound_date") or item.get("depart_date") or "")[:10]
-            ret    = (item.get("return_date") or "")[:10]
-            cabin  = (item.get("cabin") or "").title()
-            mixed  = bool(item.get("mixed_cabin"))
-            if EXCLUDE_MIXED and mixed: continue
-
-            avios  = to_int(item.get("avios") or item.get("points"))
-            taxes  = to_int(item.get("taxes") or item.get("cash_taxes") or 0)
-            avail  = bool(item.get("available") if "available" in item else True)
-            link   = item.get("booking_url") or item.get("book_url") or item.get("deeplink") or ""
-
-            if not dest or not cabin or avios is None: continue
-
-            rows.append({
-                "route": f"{origin} → {dest}",
-                "depart": depart,
-                "return": ret,
-                "cabin": cabin,
-                "avios": avios,
-                "taxes": taxes if taxes is not None else 0,
-                "availability": "Yes" if avail else "No",
-                "book_url": link,
-            })
-        except Exception:
-            continue
-    return rows
-
-def rank_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(rows, key=lambda r: (r["avios"], r["taxes"], r["route"], r["depart"], r["return"]))
-
-# =======================
-# De-dupe (7-day best effort)
-# =======================
-
-def load_cache() -> Dict[str, Any]:
+    ctx = ssl.create_default_context()
+    log(f"📮 Sending via SMTP {host}:{port} as {user!r} …")
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_cache(obj: Dict[str, Any]) -> None:
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def dedupe(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    prev = load_cache()
-    prev_rows = prev.get("rows", [])
-    prev_set = set(json.dumps(r, sort_keys=True) for r in prev_rows)
-    changed = []
-    for r in rows:
-        s = json.dumps(r, sort_keys=True)
-        if s not in prev_set:
-            changed.append(r)
-    cache_obj = {"ts": TODAY.isoformat(), "rows": rows}
-    return changed, cache_obj
-
-# =======================
-# HTML email
-# =======================
-
-def color_for_avios(avios: int) -> str:
-    if avios <= SWEET_SPOT_BUS_OJ: return "#0a7d00"  # green
-    if avios < 100000:             return "#b58900"  # amber
-    return "#7f8c8d"                                   # grey
-
-def build_html(rows: List[Dict[str, Any]]) -> Tuple[str, str]:
-    date_str = TODAY.strftime("%Y-%m-%d")
-    subject = f"Daily Qatar Avios EU Search – {date_str}"
-
-    if not rows:
-        summary = "<p>No Avios availability found today.</p>"
-    else:
-        best = min(rows, key=lambda r: (r["avios"], r["taxes"]))
-        summary = (
-            f'<p><strong>{len(rows)}</strong> option(s) with Avios availability. '
-            f'Best deal: <strong>{best["route"]}</strong> '
-            f'{best["depart"]} → {best["return"]} '
-            f'{best["cabin"]} — <strong>{best["avios"]:,} Avios</strong> + NZ${best["taxes"]:,} taxes.</p>'
-        )
-
-    table_rows = []
-    for r in rows:
-        col = color_for_avios(r["avios"])
-        link_html = f'<a href="{r["book_url"]}" target="_blank">Book</a>' if r["book_url"] else ""
-        table_rows.append(
-            "<tr>"
-            f"<td>{r['route']}</td>"
-            f"<td>{r['depart']} → {r['return']}</td>"
-            f"<td>{r['cabin']}</td>"
-            f"<td style='color:{col};font-weight:600'>{r['avios']:,}</td>"
-            f"<td>NZ${r['taxes']:,}</td>"
-            f"<td>{r['availability']}</td>"
-            f"<td>{link_html}</td>"
-            "</tr>"
-        )
-
-    html = f"""
-<html>
-  <body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#222;line-height:1.45;">
-    <h2 style="margin:0 0 8px 0;">Qatar Avios EU Search</h2>
-    <div style="font-size:14px;color:#444;margin-bottom:12px;">
-      Origin: AKL &nbsp;|&nbsp; Destinations: Any EU city served by Qatar &nbsp;|&nbsp; Cabins: Business/First only<br/>
-      Window: Next 15 months &nbsp;|&nbsp; Returns: 28–35 days &nbsp;|&nbsp; Flex: ±3 days &nbsp;|&nbsp; No mixed-cabin
-    </div>
-    {summary}
-    <table cellpadding="8" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;font-size:14px;">
-      <thead>
-        <tr style="background:#f5f7fa;text-align:left;border-bottom:1px solid #e5e7eb;">
-          <th>Route</th><th>Dates (Depart → Return)</th><th>Cabin</th>
-          <th>Avios</th><th>Taxes</th><th>Availability</th><th>Booking</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(table_rows) if rows else ''}
-      </tbody>
-    </table>
-    <div style="margin-top:10px;font-size:12px;color:#666;">
-      Sweet-spot highlight: ≤ {SWEET_SPOT_BUS_OJ:,} Avios (green). Amber &lt; 100,000. Grey if none.
-    </div>
-  </body>
-</html>""".strip()
-    return subject, html
-
-# =======================
-# Email
-# =======================
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, context=ctx, timeout=25) as s:
+                s.login(user, pw)
+                s.sendmail(from_email, [to_email], msg.encode("utf-8"))
+        else:
+            with smtplib.SMTP(host, port, timeout=25) as s:
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.ehlo()
+                s.login(user, pw)
+                s.sendmail(from_email, [to_email], msg.encode("utf-8"))
+        log("✅ SMTP send OK")
+    except smtplib.SMTPAuthenticationError as e:
+        die(f"SMTP auth failed: {e}")
+    except Exception as e:
+        die(f"SMTP send failed: {e}")
 
 def send_email(subject: str, html: str) -> None:
-    if not FROM_EMAIL or not TO_EMAIL: fail("FROM_EMAIL or TO_EMAIL is not configured.")
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
-    msg["To"] = TO_EMAIL
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    # Prefer REST if available (avoids “535 auth failed” headaches)
+    if getenv_str("BREVO_API_KEY"):
+        send_email_brevo_rest(subject, html)
+        return
+    # Else fall back to SMTP if configured
+    if getenv_str("SMTP_HOST") and getenv_str("SMTP_USER") and getenv_str("SMTP_PASS"):
+        send_email_smtp(subject, html)
+        return
+    die("No email method configured: set BREVO_API_KEY (preferred) or SMTP_* envs.")
 
-    # Guard against smart quotes in creds (ASCII only)
-    try:
-        SMTP_USER.encode("ascii"); SMTP_PASS.encode("ascii")
-    except UnicodeEncodeError:
-        fail("SMTP_USER or SMTP_PASS contains non-ASCII characters (smart quotes?). Re-paste plain text.")
+# ---------- HTML ----------
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT)) as server:
-        server.ehlo(); server.starttls(context=context); server.ehlo()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(FROM_EMAIL, [TO_EMAIL], msg.as_string())
+def build_html(results: list[dict], start: str, end: str, origin: str, destinations: list[str]) -> str:
+    if not results:
+        body = f"<p>No Qatar Avios seats found from <b>{origin}</b> to EU between <b>{start}</b> and <b>{end}</b>.</p>"
+    else:
+        rows = []
+        # We don't know exact schema; try to render common fields defensively
+        for r in results:
+            d = r.get("dest") or r.get("destination") or ""
+            o = r.get("origin") or origin
+            dt = r.get("date") or r.get("outboundDate") or r.get("departure") or ""
+            cabin = r.get("cabin") or r.get("class") or ""
+            seats = r.get("seats") or r.get("available") or r.get("availability") or ""
+            flight = r.get("flight") or r.get("flightNumber") or ""
+            price = r.get("avios") or r.get("miles") or r.get("points") or ""
+            rows.append(
+                f"<tr>"
+                f"<td>{o}</td><td>{d}</td><td>{dt}</td>"
+                f"<td>{flight}</td><td>{cabin}</td><td>{seats}</td><td>{price}</td>"
+                f"</tr>"
+            )
+        table = (
+            "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse'>"
+            "<thead><tr>"
+            "<th>Origin</th><th>Dest</th><th>Date/Time</th>"
+            "<th>Flight</th><th>Cabin</th><th>Seats</th><th>Avios/Miles</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows) +
+            "</tbody></table>"
+        )
+        body = f"<p>Found <b>{len(results)}</b> options from <b>{origin}</b> to EU ({len(destinations)} destinations) " \
+               f"between <b>{start}</b> and <b>{end}</b>.</p>{table}"
 
-# =======================
-# Main
-# =======================
+    return f"""<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Qatar Avios EU</title></head>
+  <body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+    <h2>Qatar Avios EU Availability</h2>
+    {body}
+    <p style="color:#999;margin-top:16px">Generated {date.today().isoformat()}.</p>
+  </body>
+</html>
+"""
 
-def main() -> None:
-    check_env()
+# ---------- Main ----------
 
-    # 1) Destinations (routes API → fallback list)
-    dests = fetch_qr_eu_destinations()
+def main():
+    # Required config
+    api_key   = getenv_str("SEATSAERO_API_KEY", required=True)
+    avail_url = getenv_str("SEATSAERO_AVAIL_URL", required=True)
+    routes_url= getenv_str("SEATSAERO_ROUTES_URL", "")  # optional
 
-    # 2) Build payload
-    payload = generate_search_queries(dests)
+    carrier = getenv_str("CARRIER", "QR")
+    origin  = getenv_str("ORIGIN",  "AKL")
+    start, end = load_window()
 
-    # 3) Seats.aero bulk availability
-    print("Calling Seats.aero bulk availability …")
-    raw = http_post_json(AVAIL_URL, seats_headers(), payload)
+    log("🚀 Running daily Avios scan …")
+    log(f"   carrier={carrier} origin={origin} range={start} → {end}")
+    log(f"   routes_url={routes_url or '(none)'}")
+    log(f"   avail_url={avail_url}")
 
-    # 4) Parse, filter, rank
-    rows = parse_results(raw)
-    rows = [r for r in rows if r["availability"] == "Yes"]
-    rows = rank_results(rows)
+    # Sanity on auth header type
+    if not is_partner_api(avail_url):
+        log("⚠️ SEATSAERO_AVAIL_URL does not look like Partner API. Expect failures unless this is intentional.")
+    if routes_url and not is_partner_api(routes_url):
+        log("⚠️ SEATSAERO_ROUTES_URL does not look like Partner API. Expect failures unless this is intentional.")
 
-    # 5) Dedupe vs last (best effort)
-    changed, cache_obj = dedupe(rows)
+    # Destinations
+    dests = fetch_eu_destinations(routes_url, api_key)
 
-    # 6) Email (send changed if any; otherwise full set/summary)
-    use_rows = changed if changed else rows
-    subject, html = build_html(use_rows)
-    print("Sending email …")
+    # Query availability
+    log(f"🔎 Querying availability for {len(dests)} EU destinations …")
+    results = query_availability(avail_url, api_key, carrier, origin, dests, start, end)
+    log(f"✅ Availability fetch complete: {len(results)} rows")
+
+    # Email
+    subject = f"[Avios] {carrier} {origin}→EU {start}–{end} ({len(results)} hits)"
+    html = build_html(results, start, end, origin, dests)
     send_email(subject, html)
-    print("Email sent.")
-
-    # 7) Save cache (may not persist on Actions; fine)
-    save_cache(cache_obj)
+    log("🎉 Done.")
 
 if __name__ == "__main__":
     try:
         main()
+    except SystemExit:
+        raise
     except Exception as e:
-        print(str(e), file=sys.stderr); sys.exit(1)
+        die(f"Unhandled error: {e!r}")
