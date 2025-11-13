@@ -1,1 +1,58 @@
-# paste the YAML above here
+name: Avios Daily Search
+
+on:
+  schedule:
+    # Daily around 18:00 UTC (morning NZDT). Tweak as you like.
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  avios-daily:
+    runs-on: ubuntu-latest
+
+    env:
+      # Secrets from repo → set via: gh secret set ...
+      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+      BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+
+      # Email metadata
+      FROM_EMAIL:        "alerts@imoffto.xyz"
+      FROM_NAME:         "Avios Bot"
+      TO_EMAIL:          "milo@imoffto.xyz"
+
+      # Behaviour flags
+      DRY_RUN:           "0"   # "0" = send email, "1" = log only
+      DEBUG:             "1"   # "1" = verbose logging
+
+      # Just to make logs nicer
+      PYTHONUNBUFFERED:  "1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # Minimal deps if you never created requirements.txt
+            pip install requests python-dateutil
+          fi
+
+      - name: Run Avios daily search
+        run: |
+          echo "🚀 Running Avios daily search…"
+          ls -R
+          if [ -f seats_avios_daily.py ]; then
+            python seats_avios_daily.py
+          else
+            echo "❌ seats_avios_daily.py not found in repo root"
+            exit 1
+          fi
