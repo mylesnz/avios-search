@@ -1,1 +1,78 @@
-# paste the Avios Daily Search YAML here
+name: Avios Daily Search
+
+on:
+  schedule:
+    # 18:00 UTC = 07:00 NZDT currently (adjust if you want)
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  avios-daily:
+    runs-on: ubuntu-latest
+
+    env:
+      # Secrets from repo → set via: gh secret set ...
+      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+      BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+
+      # Static email metadata (hard-coded, safe)
+      FROM_EMAIL: "alert@imoffto.xyz"
+      FROM_NAME:  "Avios Bot"
+      TO_EMAIL:   "milo@imoffto.xyz"
+
+      # Script behaviour
+      DRY_RUN: "0"        # 0 = send email, 1 = no email
+      ALWAYS_EMAIL: "1"   # 1 = email even if no good deals
+      DEBUG: "1"          # loud logs
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show workspace layout (debug)
+        run: |
+          pwd
+          ls -R
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            echo "Using requirements.txt"
+            cat requirements.txt
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt – installing bare minimum"
+            pip install requests python-dateutil
+          fi
+
+      - name: Show environment (non-secret bits)
+        run: |
+          python - << 'PY'
+          import os
+          print("PYTHON VERSION:")
+          import sys
+          print(sys.version)
+          print("\nFILES IN CWD:")
+          import os
+          print(os.listdir("."))
+          print("\nENV CHECK (masked values not printed):")
+          for k in ["SEATSAERO_API_KEY", "BREVO_API_KEY", "FROM_EMAIL", "TO_EMAIL", "DRY_RUN", "ALWAYS_EMAIL", "DEBUG"]:
+              v = os.getenv(k)
+              if v is None:
+                  print(f"{k} = <MISSING>")
+              elif "KEY" in k:
+                  print(f"{k} = <SET, {len(v)} chars>")
+              else:
+                  print(f"{k} = {v}")
+          PY
+
+      - name: Run Avios daily script
+        run: |
+          set -e
+          echo "🚀 Running seats_avios_daily.py (daily)…"
+          python seats_avios_daily.py

@@ -1,1 +1,83 @@
-# paste the Avios On-Demand Search YAML here
+name: Avios On-Demand Search
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (1 = no email, 0 = send email)"
+        required: false
+        default: "0"
+      always_email:
+        description: "Always email even if no deals found? (1/0)"
+        required: false
+        default: "1"
+      debug:
+        description: "Enable debug logging? (1/0)"
+        required: false
+        default: "1"
+
+jobs:
+  avios-manual:
+    runs-on: ubuntu-latest
+
+    env:
+      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+      BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+
+      FROM_EMAIL: "alert@imoffto.xyz"
+      FROM_NAME:  "Avios Bot"
+      TO_EMAIL:   "milo@imoffto.xyz"
+
+      DRY_RUN:      ${{ github.event.inputs.dry_run      || '0' }}
+      ALWAYS_EMAIL: ${{ github.event.inputs.always_email || '1' }}
+      DEBUG:        ${{ github.event.inputs.debug        || '1' }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show workspace layout (debug)
+        run: |
+          pwd
+          ls -R
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            echo "Using requirements.txt"
+            cat requirements.txt
+            pip install -r requirements.txt
+          else:
+            echo "No requirements.txt – installing bare minimum"
+            pip install requests python-dateutil
+          fi
+
+      - name: Show environment (non-secret bits)
+        run: |
+          python - << 'PY'
+          import os, sys
+          print("PYTHON VERSION:")
+          print(sys.version)
+          print("\nFILES IN CWD:")
+          print(os.listdir("."))
+          print("\nENV CHECK (masked values not printed):")
+          for k in ["SEATSAERO_API_KEY", "BREVO_API_KEY", "FROM_EMAIL", "TO_EMAIL", "DRY_RUN", "ALWAYS_EMAIL", "DEBUG"]:
+              v = os.getenv(k)
+              if v is None:
+                  print(f"{k} = <MISSING>")
+              elif "KEY" in k:
+                  print(f"{k} = <SET, {len(v)} chars>")
+              else:
+                  print(f"{k} = {v}")
+          PY
+
+      - name: Run Avios script (manual)
+        run: |
+          set -e
+          echo "🚀 Running seats_avios_daily.py (manual)…"
+          python seats_avios_daily.py
