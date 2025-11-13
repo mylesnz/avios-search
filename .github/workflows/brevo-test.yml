@@ -1,0 +1,77 @@
+name: Brevo Email Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  brevo-test:
+    runs-on: ubuntu-latest
+
+    env:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+      FROM_EMAIL:    ${{ secrets.FROM_EMAIL }}
+      TO_EMAIL:      ${{ secrets.TO_EMAIL }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show Brevo env info
+        run: |
+          echo "BREVO_API_KEY present: $([ -n \"$BREVO_API_KEY\" ] && echo yes || echo no)"
+          if [ -n "$BREVO_API_KEY\" ]; then
+            echo "BREVO_API_KEY prefix: ${BREVO_API_KEY:0:8}"
+            echo "BREVO_API_KEY length: ${#BREVO_API_KEY}"
+          fi
+          echo "FROM_EMAIL=${FROM_EMAIL}"
+          echo "TO_EMAIL=${TO_EMAIL}"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Send Brevo test email
+        run: |
+          python - << 'PY'
+          import os
+          import json
+          import requests
+
+          key = os.getenv("BREVO_API_KEY", "")
+          from_email = os.getenv("FROM_EMAIL")
+          to_email = os.getenv("TO_EMAIL")
+
+          print(f"Key set: {bool(key)}")
+          print(f"Key prefix: {key[:8] if key else 'NONE'}")
+          print(f"Key length: {len(key)}")
+          print(f"FROM_EMAIL={from_email}")
+          print(f"TO_EMAIL={to_email}")
+
+          if not key or not from_email or not to_email:
+              raise SystemExit("Missing BREVO_API_KEY / FROM_EMAIL / TO_EMAIL")
+
+          url = "https://api.brevo.com/v3/smtp/email"
+          payload = {
+              "sender": {"email": from_email, "name": "Avios Brevo Test"},
+              "to": [{"email": to_email}],
+              "subject": "Brevo key test from GitHub Actions",
+              "htmlContent": "<p>If you see this, BREVO_API_KEY works from GitHub Actions.</p>",
+          }
+          headers = {
+              "accept": "application/json",
+              "content-type": "application/json",
+              "api-key": key,
+          }
+
+          print("POST", url)
+          print("Headers:", {k: ('***' if k == 'api-key' else v) for k, v in headers.items()})
+          print("Payload:", json.dumps(payload))
+
+          resp = requests.post(url, headers=headers, json=payload)
+          print("Status:", resp.status_code)
+          print("Body:", resp.text)
+
+          if resp.status_code >= 300:
+              raise SystemExit(f"Brevo call failed with {resp.status_code}")
+          PY
