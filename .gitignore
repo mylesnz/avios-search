@@ -23,3 +23,8 @@ out.html
 *.key
 *.secret
 *.json.secret
+.env*
+*.env
+*.key
+*.secret
+*.json.secret
