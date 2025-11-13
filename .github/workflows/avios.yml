@@ -2,67 +2,40 @@ name: Avios Daily Search
 
 on:
   schedule:
-    # Run once a day – adjust cron if you want a different time
-    - cron: "0 17 * * *"
+    - cron: "5 17 * * *"
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Dry run (1=no email, 0=send email)"
-        required: true
-        default: "0"
-      always_email:
-        description: "Always email even if nothing great is found (1=yes, 0=no)"
-        required: true
-        default: "1"
-      debug:
-        description: "Verbose logging (1=yes, 0=no)"
-        required: true
-        default: "1"
 
 jobs:
-  avios:
+  avios-daily:
     runs-on: ubuntu-latest
-
-    env:
-      # Secrets (you already set these with gh secret set …)
-      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
-      BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
-
-      # Static email metadata
-      FROM_EMAIL: "alert@imoffto.xyz"
-      FROM_NAME:  "Avios Bot"
-      TO_EMAIL:   "milo@imoffto.xyz"
-
-      # Flags – if manual run, use inputs; otherwise defaults
-      DRY_RUN:      ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run      || '0' }}
-      ALWAYS_EMAIL: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.always_email || '1' }}
-      DEBUG:        ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug        || '1' }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Show environment (non-secret)
-        run: |
-          echo "PWD: $(pwd)"
-          echo "Repo contents:"
-          ls -R
-          echo "SEATSAERO_API_KEY set? $( [ -n "$SEATSAERO_API_KEY" ] && echo yes || echo no )"
-          echo "BREVO_API_KEY set? $( [ -n "$BREVO_API_KEY" ] && echo yes || echo no )"
-          echo "DRY_RUN=$DRY_RUN"
-          echo "ALWAYS_EMAIL=$ALWAYS_EMAIL"
-          echo "DEBUG=$DEBUG"
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install requests
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
 
       - name: Run Avios daily search
+        env:
+          SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+          BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+          FROM_EMAIL:        "alert@imoffto.xyz"
+          FROM_NAME:         "Avios Bot"
+          TO_EMAIL:          "milo@imoffto.xyz"
+          DRY_RUN:           "0"
+          DEBUG:             "1"
         run: |
+          echo "🚀 Running Avios daily search..."
           python seats_avios_daily.py
