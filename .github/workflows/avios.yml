@@ -1,9 +1,11 @@
 name: Avios Daily Search
 
 on:
+  # Daily run (adjust cron if you want another time)
   schedule:
-    # 17:00 UTC = 06:00 NZDT (approx – adjust if you want)
-    - cron: "0 17 * * *"
+    # Runs at 16:00 UTC every day (5am NZDT is UTC+13 -> 16:00 UTC previous day)
+    - cron: '0 16 * * *'
+  # Manual run from the Actions tab
   workflow_dispatch: {}
 
 jobs:
@@ -11,41 +13,48 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repo
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # If you ever add requirements.txt, switch to: pip install -r requirements.txt
           pip install requests python-dateutil
 
       - name: Debug secrets presence (no values printed)
         env:
           SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
           BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+          FROM_EMAIL:        ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL:          ${{ secrets.TO_EMAIL }}
         run: |
           python - << 'PY'
           import os
-          print("SEATSAERO_API_KEY set:", bool(os.getenv("SEATSAERO_API_KEY")))
-          print("BREVO_API_KEY set:", bool(os.getenv("BREVO_API_KEY")))
+
+          def check(name, prefix=None):
+              val = os.getenv(name, "")
+              print(f"{name} present:", bool(val))
+              if prefix is not None:
+                  print(f"{name} starts with '{prefix}':", val.startswith(prefix))
+              print(f"{name} length:", len(val))
+
+          check("SEATSAERO_API_KEY", "pro_")
+          check("BREVO_API_KEY", "xkeysib-")
+          check("FROM_EMAIL")
+          check("TO_EMAIL")
           PY
 
       - name: Run Avios daily search
         env:
           SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
           BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
-
-          FROM_EMAIL: "alert@imoffto.xyz"
-          FROM_NAME:  "Avios Daily Bot"
-          TO_EMAIL:   "milo@imoffto.xyz"
-
-          DRY_RUN: "0"   # 0 = send email
-          DEBUG:  "1"
+          FROM_EMAIL:        ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL:          ${{ secrets.TO_EMAIL }}
+          FROM_NAME:         "Avios Daily Bot"
         run: |
           python seats_avios_daily.py
