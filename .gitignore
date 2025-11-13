@@ -11,3 +11,10 @@ seats_avios_daily.py.bak
 *.json.secret
 out.html
 .seen_hits.json
+.env*
+*.env
+*.key
+*.secret
+*.json.secret
+out.html
+.seen_hits.json
