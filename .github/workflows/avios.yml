@@ -1,11 +1,9 @@
 name: Avios Daily Search
 
 on:
-  # Run every day at 06:00 UTC (adjust if you want)
   schedule:
-    - cron: "0 18 * * *"
-  # And allow manual runs
-  workflow_dispatch:
+    - cron: "0 17 * * *"
+  workflow_dispatch: {}
 
 jobs:
   avios-daily:
@@ -14,10 +12,13 @@ jobs:
     env:
       SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
       BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
-      FROM_EMAIL:        ${{ secrets.FROM_EMAIL }}
-      TO_EMAIL:          ${{ secrets.TO_EMAIL }}
-      # optional toggles if your script honours them:
-      DRY_RUN:           "0"
+
+      FROM_EMAIL: alert@imoffto.xyz
+      FROM_NAME:  "Avios EU Bot"
+      TO_EMAIL:   milo@imoffto.xyz
+
+      DRY_RUN: "0"
+      DEBUG:  "1"
 
     steps:
       - name: Checkout repo
@@ -26,24 +27,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil
-
-      - name: Debug env presence
-        run: |
-          echo "SEATSAERO_API_KEY present: $([ -n \"$SEATSAERO_API_KEY\" ] && echo yes || echo no)"
-          echo "BREVO_API_KEY present:     $([ -n \"$BREVO_API_KEY\" ] && echo yes || echo no)"
-          if [ -n "$BREVO_API_KEY" ]; then
-            echo "BREVO_API_KEY prefix: ${BREVO_API_KEY:0:8}"
-            echo "BREVO_API_KEY length: ${#BREVO_API_KEY}"
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           fi
-          echo "FROM_EMAIL=$FROM_EMAIL"
-          echo "TO_EMAIL=$TO_EMAIL"
+          pip install requests
 
       - name: Run Avios daily search
-        run: |
-          python seats_avios_daily.py
+        run: python seats_avios_daily.py
