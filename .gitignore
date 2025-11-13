@@ -4,3 +4,10 @@ out.html
 seats_avios_daily.old
 seats_avios_daily.py.bak
 
+.env*
+*.env
+*.key
+*.secret
+*.json.secret
+out.html
+.seen_hits.json
