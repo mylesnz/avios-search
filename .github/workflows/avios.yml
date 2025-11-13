@@ -1,4 +1,4 @@
-name: Avios On-Demand Search
+\name: Avios On-Demand Search
 
 on:
   workflow_dispatch:
@@ -21,25 +21,23 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # Secrets
       SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
-      BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
+      # Non-secret config
       FROM_EMAIL: "alert@imoffto.xyz"
-      FROM_NAME:  "Avios Bot"
-      TO_EMAIL:   "milo@imoffto.xyz"
+      FROM_NAME: "Avios Bot"
+      TO_EMAIL: "milo@imoffto.xyz"
 
-      DRY_RUN:      ${{ github.event.inputs.dry_run      || '0' }}
+      # Behaviour flags wired from inputs, with sane defaults
+      DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
       ALWAYS_EMAIL: ${{ github.event.inputs.always_email || '1' }}
-      DEBUG:        ${{ github.event.inputs.debug        || '1' }}
+      DEBUG: ${{ github.event.inputs.debug || '1' }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Show workspace layout (debug)
-        run: |
-          pwd
-          ls -R
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,35 +47,12 @@ jobs:
       - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
-            echo "Using requirements.txt"
-            cat requirements.txt
             pip install -r requirements.txt
-          else:
-            echo "No requirements.txt – installing bare minimum"
+          else
             pip install requests python-dateutil
           fi
 
-      - name: Show environment (non-secret bits)
+      - name: Run Avios search
         run: |
-          python - << 'PY'
-          import os, sys
-          print("PYTHON VERSION:")
-          print(sys.version)
-          print("\nFILES IN CWD:")
-          print(os.listdir("."))
-          print("\nENV CHECK (masked values not printed):")
-          for k in ["SEATSAERO_API_KEY", "BREVO_API_KEY", "FROM_EMAIL", "TO_EMAIL", "DRY_RUN", "ALWAYS_EMAIL", "DEBUG"]:
-              v = os.getenv(k)
-              if v is None:
-                  print(f"{k} = <MISSING>")
-              elif "KEY" in k:
-                  print(f"{k} = <SET, {len(v)} chars>")
-              else:
-                  print(f"{k} = {v}")
-          PY
-
-      - name: Run Avios script (manual)
-        run: |
-          set -e
-          echo "🚀 Running seats_avios_daily.py (manual)…"
+          echo "🚀 Running seats_avios_daily.py (manual)..."
           python seats_avios_daily.py

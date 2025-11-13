@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+DRY_RUN = int(os.getenv("DRY_RUN", "1"))
+DEBUG   = int(os.getenv("DEBUG", "0"))
+
+if DEBUG:
+    print(f"[DEBUG] DRY_RUN={DRY_RUN} (0=send email), TO_EMAIL={os.getenv('TO_EMAIL')}, FROM_EMAIL={os.getenv('FROM_EMAIL')}")
+
 """
 Seats.aero → HTML email for Qatar Avios EU search, grouped by month (NZ date).
 - Hub scan via DOH to avoid QR codeshare/region quirks.
@@ -404,6 +410,13 @@ def render_html(grouped_rows, scan_origin, subject_date):
         parts.append(table(header + "<tbody>{}</tbody>".format("".join(body))))
 
     return "\n".join(parts)
+
+if DRY_RUN:
+    print("[DEBUG] DRY_RUN=1 – skipping Brevo send, writing HTML only")
+    # don’t call send_email(...)
+else:
+    print("[DEBUG] DRY_RUN=0 – sending Brevo email now…")
+    send_email(...)  # whatever your function is
 
 def send_brevo_rest(subject, html_body):
     if not BREVO_API_KEY:
