@@ -1,0 +1,47 @@
+name: Avios Daily Search
+
+on:
+  schedule:
+    # Run once per day at 17:00 UTC (morning NZ)
+    - cron: "0 17 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  avios-daily:
+    runs-on: ubuntu-latest
+
+    env:
+      # Secrets from GitHub
+      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+      BREVO_API_KEY:     ${{ secrets.BREVO_API_KEY }}
+
+      # Fixed email settings
+      FROM_EMAIL: alert@imoffto.xyz
+      FROM_NAME:  "Avios EU Bot"
+      TO_EMAIL:   milo@imoffto.xyz
+
+      # Script behaviour
+      DRY_RUN: "0"   # 0 = actually send email
+      DEBUG:  "1"    # keep verbose logging for now
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install requests
+
+      - name: Run Avios daily search
+        run: |
+          echo "Running seats_avios_daily.py..."
+          python seats_avios_daily.py
