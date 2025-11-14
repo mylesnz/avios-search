@@ -1,0 +1,47 @@
+name: Run Avios daily search
+
+on:
+  schedule:
+    # Runs every day at 18:00 UTC (07:00 NZT approx, depending on DST)
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  avios-daily:
+    runs-on: ubuntu-latest
+
+    env:
+      SEATSAERO_API_KEY: ${{ secrets.SEATSAERO_API_KEY }}
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+      TO_EMAIL: ${{ secrets.TO_EMAIL }}
+      FROM_NAME: ${{ secrets.FROM_NAME }}
+      DRY_RUN: "0"
+      DEBUG: "1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (if any)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Run Avios daily script
+        run: |
+          python seats_avios_daily.py
+
+      - name: Upload HTML result as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avios-out-html
+          path: out.html
+          if-no-files-found: ignore
